@@ -1,0 +1,6 @@
+requests
+discogs-client
+requests-toolbelt
+qrcode
+Pillow
+pyzbar
