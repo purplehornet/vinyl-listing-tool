@@ -1,0 +1,60 @@
+{
+  "enforce_vinyl": true,
+  "preferred_currency": "GBP",
+
+  "discogs_token": "REPLACE_ME",
+  "discogs_consumer_key": "",
+  "discogs_consumer_secret": "",
+  "discogs_oauth_token": "",
+  "discogs_oauth_token_secret": "",
+  "discogs_username": "your_discogs_username",
+  "discogs_user_agent": "VinylTool/1.0",
+
+  "ebay_app_id": "REPLACE_ME",
+  "ebay_dev_id": "",
+  "ebay_cert_id": "REPLACE_ME",
+  "ebay_user_token": "REPLACE_ME",
+  "ebay_iaf_token": "",
+  "ebay_ru_name": "REPLACE_ME",
+  "ebay_refresh_token": "REPLACE_ME",
+
+  "marketplace_id": "EBAY_GB",
+
+  "ebay_payment_policy_id": "REPLACE_ME",
+  "ebay_return_policy_id": "REPLACE_ME",
+  "ebay_shipping_policy_id": "REPLACE_ME",
+  "ebay_shipping_policy_id_paid": "REPLACE_ME",
+  "ebay_shipping_policy_id_free": "REPLACE_ME",
+
+  "ebay_location_key": "REPLACE_ME",
+  "ebay_merchant_location_key": "REPLACE_ME",
+
+  "paypal_email": "",
+  "postal_code": "",
+  "city": "",
+  "country": "GB",
+
+  "rounding_style": "99",
+  "round_mode": "up",
+  "market_multiplier": 1.0,
+
+  "seller_footer": "",
+
+  "auto_sync_enabled": true,
+  "two_way_sync_enabled": true,
+  "auto_sync_interval": 300,
+  "attempt_discogs_updates": true,
+
+  "status_mappings": {
+    "For Sale": "For Sale",
+    "Draft": "Draft",
+    "Expired": "Not For Sale",
+    "Sold": "Sold",
+    "Suspended": "Not For Sale",
+    "Deleted": "Not For Sale"
+  },
+
+  "last_successful_sync_time": null,
+  "image_staging_path": "",
+  "extra": {}
+}
