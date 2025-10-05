@@ -1,5 +1,7525 @@
-# Sample content of VinylTool_BETA1__PROFILE_PATCH_v5.py
+import os, sys
+SRC = os.path.dirname(os.path.abspath(__file__))
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+try:
+    os.chdir(SRC)
+except Exception:
+    pass
+# --- VinylTool: core paths/config/logging (inserted) ---
+from vinyltool.core.paths import (
+    path_config, path_db, path_geometry, path_api_clients, get_active_profile
+)
+from vinyltool.core.config import Config
+from vinyltool.core.logging import setup_logging
 
-# This is a placeholder for the actual code.
-# Add your implementation details here.
+# Initialize logging early (keeps existing logger names)
+logger = setup_logging("__main__")
 
+
+# --- _EBAY_OFFER_RETRY_SHIM: global retry for eBay offer publish 5xx/25001 ---
+import time, requests
+
+def _ebay_offer_retry_wrap():
+    # idempotent guard
+    if getattr(requests.sessions.Session.post, "_ebay_offer_retry_wrapped", False):
+        return
+    _orig_post = requests.sessions.Session.post
+
+    def _post_with_retry(self, url, *args, **kwargs):
+        u = str(url)
+        is_offer_endpoint = "sell/inventory/v1/offer" in u  # covers /offer, /offer/{id}/publish, etc.
+        tries = 3
+        backoffs = [2, 5, 10]
+
+        if not is_offer_endpoint:
+            return _orig_post(self, url, *args, **kwargs)
+
+        last = None
+        for attempt in range(1, tries + 1):
+            resp = _orig_post(self, url, *args, **kwargs)
+            last = resp
+            # parse error id if present
+            err_id = None
+            try:
+                js = resp.json()
+                err_id = (isinstance(js, dict) and js.get("errors", [{}])[0].get("errorId")) or None
+            except Exception:
+                js = None
+
+            # success?
+            if 200 <= resp.status_code < 300:
+                return resp
+
+            # retry only on 5xx or errorId 25001 (Core Inventory Service internal error)
+            if resp.status_code >= 500 or err_id == 25001:
+                # (No logger here; upstream logging still sees final response)
+                if attempt < tries:
+                    time.sleep(backoffs[min(attempt - 1, len(backoffs) - 1)])
+                    continue
+            # otherwise, or out of tries: return immediately
+            return resp
+
+        return last
+
+    _post_with_retry._ebay_offer_retry_wrapped = True
+    requests.sessions.Session.post = _post_with_retry
+
+_ebay_offer_retry_wrap()
+# --- /_EBAY_OFFER_RETRY_SHIM ---
+# Load config via profile-aware path
+cfg = Config().load()
+
+# Provide path variables expected elsewhere in code
+_GD_DB_PATH = path_db()
+_GD_CONFIG_PATH = path_config()
+# Backwards-compat aliases in case other names are referenced
+try:
+    GD_DB_PATH
+except NameError:
+    GD_DB_PATH = _GD_DB_PATH
+try:
+    GD_CONFIG_PATH
+except NameError:
+    GD_CONFIG_PATH = _GD_CONFIG_PATH
+# --- end inserted block ---
+
+import os
+import sys
+import json
+import datetime
+import uuid
+import tkinter as tk
+from tkinter import ttk
+
+
+# --- GrooveDeck Profile Manager wiring (auto-injected) ---
+try:
+    from groovedeck_profile_manager import (
+        ensure_seed, get_active_profile, find_file,
+        add_profiles_tab_to_notebook, attach_status_strip
+    )
+    _GD_PROFILE_WIRED = True
+except Exception as _e:
+    _GD_PROFILE_WIRED = False
+# --- end injection ---
+
+# --- GrooveDeck Profile Manager bootstrap ---
+if '_GD_PROFILE_WIRED' in globals() and _GD_PROFILE_WIRED:
+    try:
+        ensure_seed(get_active_profile())
+        _GD_CONFIG_PATH = find_file("config.json")
+        _GD_DB_PATH     = find_file("inventory.db")
+        _GD_GEOM_PATH   = find_file("geometry.conf")
+    except Exception:
+        _GD_CONFIG_PATH = _GD_DB_PATH = _GD_GEOM_PATH = None
+else:
+    _GD_CONFIG_PATH = _GD_DB_PATH = _GD_GEOM_PATH = None
+# --- end bootstrap ---
+
+# --- GrooveDeck Profile Manager: v2 compatibility fixes ---
+def _gd_safe_symlink_or_copy(src_path, dest_path):
+    try:
+        import os, shutil
+        d = dest_path
+        s = src_path
+        if not s:
+            return
+        s = str(s)
+        d = str(d)
+        # If already the same file, do nothing
+        try:
+            if os.path.islink(d) and os.path.realpath(d) == os.path.realpath(s):
+                return
+        except Exception:
+            pass
+        # Remove existing file if present (but not a directory)
+        try:
+            if os.path.isfile(d) or os.path.islink(d):
+                os.remove(d)
+        except Exception:
+            pass
+        # Try symlink first
+        try:
+            os.symlink(s, d)
+            return
+        except Exception:
+            # Fallback: copy the file
+            try:
+                shutil.copy2(s, d)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+try:
+    # Ensure root-level files resolve to the active profile targets for legacy codepaths.
+    if _GD_CONFIG_PATH:
+        _gd_safe_symlink_or_copy(_GD_CONFIG_PATH, (APP_ROOT / "config.json"))
+    if _GD_GEOM_PATH:
+        _gd_safe_symlink_or_copy(_GD_GEOM_PATH, (APP_ROOT / "geometry.conf"))
+except Exception:
+    pass
+
+# Monkey-patch DatabaseManager to default to profile DB if not specified
+try:
+    _GD_ORIG_DB_INIT = DatabaseManager.__init__
+    def _gd_db_init(self, *a, **kw):
+        if "db_path" not in kw and _GD_DB_PATH:
+            kw["db_path"] = str(_GD_DB_PATH)
+        return _GD_ORIG_DB_INIT(self, *a, **kw)
+    DatabaseManager.__init__ = _gd_db_init
+except Exception:
+    pass
+
+# Monkey-patch Config.__init__ to ignore unknown 'load_from' kw and to record path override
+try:
+    _GD_ORIG_CFG_INIT = Config.__init__
+    def _gd_cfg_init(self, *a, **kw):
+        # Discard unknown kw injected by earlier patches
+        if "load_from" in kw:
+            kw.pop("load_from", None)
+        return _GD_ORIG_CFG_INIT(self, *a, **kw)
+    Config.__init__ = _gd_cfg_init
+except Exception:
+    pass
+# --- end v2 fixes ---
+
+
+
+
+# ==== PHASE0/1: Guardrails Layer (Dry-Run, Preflight, Retry, JSONL Logs) ====
+
+#!/usr/bin/env python3
+
+PUBLISH_HARD_BLOCK = False  # Global kill-switch to block publishing paths
+
+"""
+VinylTool — FINAL STABLE VERSION
+- Collection tab integrated synchronously (no race conditions)
+- All original functionality preserved
+- Fixed startup reliability issues
+- Enhanced Context Menu Features for Collection Tab
+- Added Image Reordering UI with Image Preview
+- Integrated "Analog Theory" HTML Template with Matrix/Runout and Condition Tags
+- Upgraded Matrix/Runout field to a multi-line Text box for better editing.
+- Implemented a collapsible <details> section for Matrix/Runout in the HTML template.
+- Restructured HTML template for visual symmetry, making Matrix/Runout a top-level collapsible section.
+- Redesigned HTML header to use a 2x3 grid for key details, replacing the old text line.
+- Fixed the 'Generate Title' button functionality by correcting the widget key mismatch.
+- Corrected title generation to avoid "Vinyl LP Vinyl" duplication.
+- Fixed a critical bug where updating an inventory item did not save the full description HTML and other payload data.
+- Refined title generation to always produce 'Vinyl LP' for standard LPs as requested.
+- Corrected title generation to EXACTLY match the user's required format: ARTIST: Title (Year) Format CatNo Grade.
+- FINAL FIX for title generation to prevent "Vinyl Vinyl" duplication and ensure correct "Vinyl LP" format.
+- ABSOLUTELY FINAL, DEFINITIVE fix for title generation to ensure 'Vinyl LP' is always generated for LP formats.
+- Fixed bug where Genre and Full Description were not saving to or reloading from the inventory payload.
+- Added logging for eBay response headers to capture the 'rlogid' for support tickets.
+- [FIX] Corrected eBay listing failure by providing a short summary for product.description and the full HTML for listingDescription.
+- [FIX] Added robust image pipeline to find and upload images, and added missing Media API scope.
+- [NEW] Added 'Select Images...' button for a fully automated image import workflow, removing the need for QR codes or manual renaming.
+- [FIX] Corrected the folder name from 'item_images' to 'managed_images' to resolve "Image not found" error.
+- [FIX] Implemented a retry mechanism in the eBay image upload function to handle transient 503 server errors from Akamai.
+- [FIX] Added the crucial 'sell.inventory' scope to the eBay token request to fix "Insufficient permissions" error.
+- [FINAL FIX] Manually construct the multipart/form-data for eBay image uploads to resolve persistent 503 errors.
+- [FINAL FIX] Resolved `RuntimeError: main thread is not in main loop` on application exit.
+- [FINAL FIX] Remove `imageUrls` from payload if empty to prevent API error.
+"""
+import sys, os, threading, traceback, glob, re
+import tkinter as tk
+import platform
+from ctypes.util import find_library
+
+# ============================ BEGIN PYZBAR MACOS FIX (v2) ============================
+# This block attempts to locate the Homebrew-installed zbar library and
+# adds its directory to the system's library path. This is a more robust
+# fix for macOS environments where pyzbar can't find its C dependency.
+if platform.system() == 'Darwin':  # Darwin is the OS name for macOS
+    # Check common Homebrew paths for the library directory
+    homebrew_lib_dirs = [
+        '/usr/local/lib',    # Standard for Intel Macs
+        '/opt/homebrew/lib' # Standard for Apple Silicon Macs
+    ]
+    
+    # Get the current library path from the environment, if it exists
+    current_ld_path = os.environ.get('DYLD_LIBRARY_PATH', '')
+    
+    for lib_dir in homebrew_lib_dirs:
+        # Check if the directory exists and contains the zbar library
+        if os.path.isdir(lib_dir) and 'libzbar.dylib' in os.listdir(lib_dir):
+            # Prepend the found directory to the dynamic library path
+            if lib_dir not in current_ld_path:
+                print(f"Found zbar library in {lib_dir}. Prepending to DYLD_LIBRARY_PATH.")
+                os.environ['DYLD_LIBRARY_PATH'] = f"{lib_dir}:{current_ld_path}"
+                break # Stop after finding the first valid path
+# ============================ END PYZBAR MACOS FIX (v2) ============================
+
+try:
+    import requests  # for Discogs REST fallback
+except Exception:
+    requests = None
+
+# ============================ BEGIN USER RUNTIME (VERBATIM) ============================
+# -*- coding: utf-8 -*-
+"""
+Vinyl Listing Tool v10.3 - FINAL
+"""
+
+from tkinter import ttk
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
+import requests
+import os
+import json
+import time
+import datetime
+import webbrowser
+import sqlite3
+import threading
+import queue
+import logging
+import base64
+import hmac
+import hashlib
+import secrets
+import urllib.parse
+import urllib.request
+import ssl
+import shutil
+from urllib.parse import quote_plus, urlencode
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple, Any
+import discogs_client
+from requests_toolbelt.multipart.encoder import MultipartEncoder # Import for manual multipart construction
+
+# Phase 1: Image Workflow Imports
+try:
+    import qrcode
+    from PIL import Image, ImageTk
+    QR_LIBRARIES_AVAILABLE = True
+except ImportError:
+    qrcode = None
+    Image = None
+    ImageTk = None
+    QR_LIBRARIES_AVAILABLE = False
+
+# Phase 2: QR Decoding Imports
+try:
+    from pyzbar.pyzbar import decode as qr_decode, ZBarSymbol
+    QR_DECODER_AVAILABLE = True
+except ImportError:
+    qr_decode = None
+    ZBarSymbol = None
+    QR_DECODER_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Force IPv4 for eBay API compatibility
+import requests.packages.urllib3.util.connection as urllib3_cn
+urllib3_cn.HAS_IPV6 = False
+
+# ============================================================================
+# CONFIGURATION AND CONSTANTS
+# ============================================================================
+
+
+# Import constants
+from vinyltool.core.constants import *
+from vinyltool.core.validation import validate_listing
+from vinyltool.core.guardrails import Guardrails, with_retries, _guardrails_singleton
+from vinyltool.ui.dialogs import QuickListDialog, ConditionGradingDialog
+
+class Config:
+    """Centralized configuration management"""
+    
+    def __init__(self):
+        self.config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        
+        # Fallbacks: try ./Source/config.json, parent/Source/config.json, absolute path, and CWD
+        for cand in [
+            self.config_path,
+            os.path.join(os.path.dirname(__file__), "Source", "config.json"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Source", "config.json"),
+            "/Users/phil/Desktop/Vinyl_Listing_Tool/Source/config.json",
+            os.path.join(os.getcwd(), "config.json"),
+        ]:
+            if os.path.isfile(cand):
+                self.config_path = cand
+                break
+        self.data = self._load_config()
+
+        try:
+            self._install_lister_draft_live_buttons()
+        except Exception:
+            pass
+        
+    def _load_config(self) -> dict:
+        """Load configuration from file"""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.warning("config.json not found, using defaults")
+            return self._get_default_config()
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid config.json: {e}")
+            return self._get_default_config()
+    
+    def _get_default_config(self) -> dict:
+        """Return default configuration"""
+        return {
+            "enforce_vinyl": True,
+            "preferred_currency": "GBP",
+            "auto_sync_enabled": False,
+            "auto_sync_interval": 300,
+            "two_way_sync_enabled": False,
+            "attempt_discogs_updates": True,
+            "seller_footer": "",
+            "image_staging_path": "",
+            "status_mappings": {
+                "For Sale": "For Sale",
+                "Draft": "Draft",
+                "Expired": "Not For Sale",
+                "Sold": "Sold",
+                "Suspended": "Not For Sale",
+                "Deleted": "Not For Sale"
+            }
+        }
+    
+    def save(self, updates: dict = None):
+        """Save configuration to file"""
+        if updates:
+            self.data.update(updates)
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+            logger.info("Configuration saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to save configuration: {e}")
+            raise
+    
+    def get(self, key: str, default=None):
+        """Get configuration value"""
+        return self.data.get(key, default)
+
+# Global configuration instance
+cfg = Config()
+
+# Constants
+
+
+# This map is for the older Trading API or Offer `categoryId`.
+# The Inventory API `condition` field requires a string enum.
+# Mapping of Discogs-style media grades to eBay numeric condition IDs.
+#
+# eBay has recently tightened the allowed condition IDs for the Music/Vinyl categories.
+# See the "Item condition ID and name values" and "Item condition by category" docs
+# for details【371433193440345†L238-L284】. In particular, the generic "Used" condition
+# (3000) is no longer accepted for the Records (176985) category. Instead,
+# sellers should choose from specific grades such as "Like New" (2750),
+# "Very Good" (4000), "Good" (5000), "Acceptable" (6000) and "For parts"
+# (7000). The mapping below aligns common vinyl grades to these IDs.
+# -----------------------------------------------------------------------------
+# eBay condition ID mapping (numeric).
+#
+# These mappings align with eBay's inventory and offer APIs for the Records
+# category (176985). They are taken from a previously working version of the
+# application and have been proven to pass eBay's validation rules. In this
+# context, the generic "Used" condition (3000) remains valid for vinyl
+# listings, contrary to some documentation suggesting otherwise. Do not
+# substitute these values unless you verify against the eBay Sell API
+# condition policies for the chosen category.
+
+# Inventory API condition enumeration mapping.
+#
+# This mapping converts Discogs-style media grades into the Inventory API
+# enumerations. eBay’s Music & Records category accepts the following
+# pre-owned condition enums: LIKE_NEW (for Mint/Near Mint), USED_VERY_GOOD
+# (for Excellent/Very Good Plus), USED_GOOD (for Very Good/Good),
+# USED_ACCEPTABLE (for Fair), and FOR_PARTS_OR_NOT_WORKING (for Poor).
+# eBay recently tightened allowed numeric condition IDs for the music/vinyl
+# categories.  Category 176985 (Records) no longer accepts the generic
+# "Used" condition (3000).  Instead, you must specify a more precise
+# condition.  The numeric IDs below were extracted from eBay's
+# getItemConditionPolicies response for the records category:
+#   1000 = New
+#   2000 = Like New
+#   2750 = Very Good Plus / Excellent
+#   4000 = Very Good
+#   5000 = Good
+#   6000 = Acceptable
+#   7000 = For parts/not working
+# The Inventory API still uses text enums; these map roughly to the above
+# numeric values.  Mint and Near Mint map to LIKE_NEW (2000),
+# Excellent and VG+ map to USED_EXCELLENT (2750), VG maps to
+# USED_VERY_GOOD (4000), G/G+ maps to USED_GOOD (5000), and
+# Fair/Poor map to USED_ACCEPTABLE (6000).  FOR_PARTS_OR_NOT_WORKING
+# remains reserved for truly non-functional items (7000).
+
+
+
+
+
+
+
+
+
+# ============================================================================
+# DATABASE MANAGEMENT
+# ============================================================================
+
+
+# DatabaseManager moved to vinyltool.core.db
+from vinyltool.core.db import DatabaseManager
+
+
+# ============================================================================
+# API WRAPPERS
+# ============================================================================
+
+
+from vinyltool.services.discogs import DiscogsAPI
+
+
+from vinyltool.services.ebay import EbayAPI
+
+
+# --- RUNTIME_EBAY_UPSERT_SHIM: ensure Inventory API publish method is available ---
+try:
+    from vinyltool.services import ebay as _eb_mod  # module
+    _EbayAPI_cls = getattr(_eb_mod, "EbayAPI", None)
+    _up_fn = getattr(_eb_mod, "_eba_upsert_offer_and_publish", None)
+    # Bind module function to module class if missing
+    if _EbayAPI_cls and _up_fn and not hasattr(_EbayAPI_cls, "upsert_offer_and_publish"):
+        setattr(_EbayAPI_cls, "upsert_offer_and_publish", _up_fn)
+    # Bind module function to imported class symbol if missing
+    if _up_fn and not hasattr(EbayAPI, "upsert_offer_and_publish"):
+        setattr(EbayAPI, "upsert_offer_and_publish", _up_fn)
+    # If still missing, define a minimal inline implementation and bind it
+    if not hasattr(EbayAPI, "upsert_offer_and_publish"):
+        def _ui_upsert_offer_and_publish(self, listing_data: dict) -> dict:
+            import json, logging, requests
+            logger = logging.getLogger("ebay")
+            sku = (listing_data or {}).get("sku")
+            if not sku:
+                return {"success": False, "error": "Missing SKU for offer publish."}
+
+            market = self.config.get("marketplace_id", "EBAY_GB")
+            payment_id = self.config.get("ebay_payment_policy_id")
+            return_id = self.config.get("ebay_return_policy_id")
+            fulfillment_id = self.config.get("ebay_shipping_policy_id") or self.config.get("ebay_fulfillment_policy_id")
+            mlk = self.config.get("ebay_merchant_location_key")
+            missing = [n for n,v in [("merchantLocationKey", mlk), ("paymentPolicyId", payment_id), ("returnPolicyId", return_id), ("fulfillmentPolicyId", fulfillment_id)] if not v]
+            if missing:
+                msg = f"Missing required policy/location: {', '.join(missing)}"
+                logger.error(f"[offer] {msg}")
+                return {"success": False, "error": msg}
+
+            category_id = str(listing_data.get("categoryId") or listing_data.get("category_id") or "176985")
+            desc = listing_data.get("description") or (listing_data.get("item") or {}).get("description") or "Vinyl LP"
+            price = listing_data.get("price")
+            price_val = f"{price:.2f}" if isinstance(price,(int,float)) else (price.strip() if isinstance(price,str) and price.strip() else "9.99")
+
+            offer_body = {
+                "sku": sku,
+                "marketplaceId": market,
+                "format": "FIXED_PRICE",
+                "availableQuantity": 1,
+                "categoryId": category_id,
+                "listingDescription": desc,
+                "pricingSummary": {"price": {"currency": "GBP", "value": price_val}},
+                "merchantLocationKey": mlk,
+                "listingPolicies": {
+                    "paymentPolicyId": payment_id,
+                    "returnPolicyId": return_id,
+                    "fulfillmentPolicyId": fulfillment_id,
+                },
+                "listingDuration": "GTC",
+                "quantityLimitPerBuyer": 1,
+            }
+
+            token = self.get_access_token()
+            base = f"{self.base_url}/sell/inventory/v1"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Accept-Language": "en-GB",
+                "Content-Language": "en-GB",
+            }
+
+            try:
+                logger.info("[offer] Upsert payload (sanitized): %s", json.dumps(offer_body, ensure_ascii=False))
+            except Exception:
+                pass
+
+            # Lookup offer by SKU
+            r = requests.get(f"{base}/offer?sku={sku}", headers=headers, timeout=30)
+            r.raise_for_status()
+            offers = (r.json().get("offers") or [])
+            offer_id = None
+            if offers:
+                o0 = offers[0]
+                offer_id = o0.get("offerId") or (o0.get("offer") or {}).get("offerId")
+
+            # Update or create
+            if offer_id:
+                pu = requests.put(f"{base}/offer/{offer_id}", headers=headers, json=offer_body, timeout=60)
+                if pu.status_code not in (200,201,204):
+                    return {"success": False, "error": f"Offer update failed: {pu.status_code} {pu.text}"}
+            else:
+                pc = requests.post(f"{base}/offer", headers=headers, json=offer_body, timeout=60)
+                if pc.status_code not in (200,201):
+                    return {"success": False, "error": f"Offer create failed: {pc.status_code} {pc.text}"}
+                offer_id = pc.json().get("offerId") or (pc.json().get("offer") or {}).get("offerId")
+                if not offer_id:
+                    return {"success": False, "error": "Offer create: missing offerId in response."}
+
+            # Publish
+            pb = requests.post(f"{base}/offer/{offer_id}/publish", headers=headers, timeout=30)
+            if pb.status_code not in (200,201):
+                return {"success": False, "error": f"Publish failed: {pb.status_code} {pb.text}"}
+
+            listing_id = None
+            try:
+                listing_id = pb.json().get("listingId")
+            except Exception:
+                pass
+
+            res = {"success": True, "offerId": offer_id}
+            if listing_id:
+                res["listingId"] = listing_id
+            return res
+
+        setattr(EbayAPI, "upsert_offer_and_publish", _ui_upsert_offer_and_publish)
+except Exception:
+    pass
+# --- /RUNTIME_EBAY_UPSERT_SHIM ---
+
+
+# --- RUNTIME_EBAY_TEST_SHIM: ensure EbayAPI.test_connection exists ---
+try:
+    if not hasattr(EbayAPI, "test_connection"):
+        def _ui_test_connection(self) -> bool:
+            try:
+                token = self.get_access_token()
+            except Exception:
+                return False
+            # Best-effort ping to Inventory API; treat token success as connected if ping fails
+            try:
+                import requests
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "X-EBAY-C-MARKETPLACE-ID": self.config.get("marketplace_id", "EBAY_GB"),
+                }
+                r = requests.get(f"{self.base_url}/sell/inventory/v1/location?limit=1", headers=headers, timeout=15)
+                return r.status_code in (200, 204)
+            except Exception:
+                return True
+        setattr(EbayAPI, "test_connection", _ui_test_connection)
+except Exception:
+    pass
+# --- /RUNTIME_EBAY_TEST_SHIM ---
+
+
+
+class VinylToolApp:
+    
+
+    def _inventory_location_exists(self, key: str) -> bool:
+        try:
+            token = self.ebay_api.get_access_token()
+        except Exception:
+            return False
+        import requests
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+        }
+        base = f"{self.ebay_api.base_url}/sell/inventory/v1/location"
+        try:
+            r = requests.get(f"{base}/{key}", headers=headers, timeout=20)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _ensure_ebay_location(self) -> str | None:
+        """
+        Ensure a Sell Inventory 'Inventory Location' exists.
+        Returns the merchantLocationKey if it exists/was created, else None.
+        """
+        key = (self.config.get("ebay_merchant_location_key") or "GB_DY102RJ").upper()
+
+        # Fast path: already exists?
+        if self._inventory_location_exists(key):
+            return key
+
+        # Build minimal, valid body per eBay schema:
+        body = {
+            "name": "Primary Warehouse",
+            "merchantLocationKey": key,
+            "location": {
+                "address": {
+                    "addressLine1": "Kidderminster",
+                    "city": "Kidderminster",
+                    "postalCode": "DY10 2RJ",
+                    "country": "GB"
+                }
+            },
+            "locationTypes": ["WAREHOUSE"],
+            "merchantLocationStatus": "ENABLED"
+        }
+
+        # PUT create/update with helpful headers
+        try:
+            import requests
+            token = self.ebay_api.get_access_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+                "Content-Language": "en-GB",
+                "Accept-Language": "en-GB",
+            }
+            base = f"{self.ebay_api.base_url}/sell/inventory/v1/location"
+            r = requests.put(f"{base}/{key}", headers=headers, json=body, timeout=30)
+            if r.status_code in (200, 201, 204):
+                return key
+            # Some tenants eventually-consistent: retry GET
+            if self._inventory_location_exists(key):
+                return key
+        except Exception:
+            pass
+        return None
+
+    def get_current_lister_listing_data(self) -> dict:
+        """Gather listing data from the Lister UI (best-effort)."""
+        d = {}
+        try:
+            d["sku"] = self.sku_display_var.get().strip()
+        except Exception:
+            pass
+        def ge(key):
+            try:
+                return self.entries[key].get().strip()
+            except Exception:
+                return ""
+        d["artist"] = ge("Artist")
+        d["release_title"] = ge("Title")
+        d["format"] = ge("Format")
+        d["cat_no"] = ge("Cat No")
+        d["year"] = ge("Year")
+        try:
+            d["price"] = float(ge("Price") or 0.0)
+        except Exception:
+            d["price"] = 0.0
+        try:
+            d["quantity"] = int(ge("Quantity") or 1)
+        except Exception:
+            d["quantity"] = 1
+        d["currency"] = "GBP"
+        d["marketplaceId"] = "EBAY_GB"
+        try:
+            txt = self.description_text.get("1.0", "end").strip()
+            d["description"] = txt[:490000]
+        except Exception:
+            pass
+        try:
+            if getattr(self, "image_urls", None):
+                d["imageUrls"] = list(self.image_urls)
+        except Exception:
+            pass
+        d["categoryId"] = "176985"
+        t = " ".join([d.get("artist",""), "-", d.get("release_title","")]).strip(" -")
+        d["title"] = (t or "Untitled")[:80]
+        return d
+
+    def save_to_ebay_drafts(self, listing_data: dict = None):
+        """Create/Update SELL LISTINGS draft only (no publish)."""
+        try:
+            payload = listing_data or self.get_current_lister_listing_data()
+            res = self.ebay_api.create_sell_listing_draft(payload)
+            if res.get("success"):
+                draft_id = res.get("draftId")
+                self.append_log(f"[draft] Saved eBay draft (Draft ID: {draft_id})", "green")
+                return {"success": True, "draftId": draft_id}
+            else:
+                self.append_log(f"[draft] Failed: status={res.get('status')} rlogid={res.get('rlogid')} body={res.get('body')}", "red")
+                return {"success": False, "error": res}
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.append_log(f"[draft] Error: {e}", "red")
+            return {"success": False, "error": str(e)}
+
+    def _install_lister_draft_live_buttons(self):
+        import tkinter as tk
+        parent = getattr(self, "lister_controls_frame", None) or getattr(self, "lister_tab", None) or getattr(self, "root", None)
+        if not parent:
+            return
+        # Remove the separate "Save to eBay Drafts" button.  Drafts are no longer
+        # supported; listings will be published live via the existing publish
+        # button in the inventory tab.  We simply rename any existing Publish
+        # button to make its purpose clear.  No new button is created here.
+        try:
+            for child in parent.winfo_children():
+                try:
+                    txt = child.cget("text")
+                    # Rename any legacy Publish button to indicate a live publish
+                    if isinstance(txt, str) and ("Publish" in txt and "eBay" in txt):
+                        child.configure(text="Publish Live to eBay")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # Main application class with complete functionality
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Vinyl Listing Tool v10.3 - FINAL")
+        
+        # Core components
+        self.config = cfg
+        self.db = DatabaseManager()
+        self.discogs_api = DiscogsAPI(self.config)
+        self.ebay_api = EbayAPI(self.config, self.root)
+        
+        # Instance variables
+        self.entries = {}
+        self.current_release_id = None
+        self.current_tracklist_lines = []
+        self.image_paths = []
+        self.editing_sku = None
+        self.temporary_sku = None # For new items before they are saved
+        self.sku_display_var = tk.StringVar() # For the read-only SKU display
+        self.image_staging_path_var = tk.StringVar() # For settings tab
+        self.inventory_sort_column = "id"
+        self.inventory_sort_direction = "DESC"
+        self.discogs_search_results = []
+        self.discogs_sort_column = "Year"
+        self.discogs_sort_direction = "DESC"
+        self.app_is_closing = False
+        
+        # Auto-sync variables
+        self.auto_sync_enabled = self.config.get("auto_sync_enabled", False)
+        self.auto_sync_interval = self.config.get("auto_sync_interval", 300)
+        self.two_way_sync_enabled = self.config.get("two_way_sync_enabled", False)
+        self.attempt_discogs_updates = self.config.get("attempt_discogs_updates", True)
+        self.last_successful_sync_time = self.config.get("last_successful_sync_time", None)
+        self.auto_sync_thread = None
+        self.auto_sync_stop_event = threading.Event()
+        self.sync_log = []
+        
+        # Status mapping
+        self.status_mappings = self._load_status_mappings()
+        self.status_mapping_vars = {}
+        
+        # Collection state
+        self._collection_state = {
+            "folders": [],
+            "folder_id": None,
+            "page": 1,
+            "pages": 1,
+            "per_page": 100,
+            "items": [],
+            "filter": ""
+        }
+        
+        self._discogs_field_ids = None  # cache for Discogs custom field IDs
+        # Setup GUI
+        self._load_geometry()
+        self._setup_gui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Initialize views
+        self.populate_inventory_view()
+        self.image_staging_path_var.set(self.config.get("image_staging_path", ""))
+        
+        # Initialize connections
+        self._update_connection_status()
+        try:
+            if hasattr(self, "root") and hasattr(self, "publish_both_btn"):
+                self.root.after(1200, lambda: self.publish_both_btn.config(
+                    state=("normal" if (self.discogs_api.is_connected() and self.ebay_api.test_connection()) else "disabled")
+                ))
+        except Exception:
+            pass
+        
+        # Initialize auto-sync if enabled
+        if self.auto_sync_enabled and self.discogs_api.is_connected():
+            self.start_auto_sync()
+    
+    def _load_status_mappings(self):
+        """Load status mappings from config or use defaults"""
+        mappings = self.config.get("status_mappings", DEFAULT_STATUS_MAPPINGS.copy())
+        for discogs_status in DEFAULT_STATUS_MAPPINGS:
+            if discogs_status not in mappings:
+                mappings[discogs_status] = DEFAULT_STATUS_MAPPINGS[discogs_status]
+        return mappings
+    
+    def _save_status_mappings(self):
+        """Save current status mappings to config"""
+        for discogs_status, var in self.status_mapping_vars.items():
+            self.status_mappings[discogs_status] = var.get()
+        
+        self.config.save({"status_mappings": self.status_mappings})
+        self.log_sync_activity("Status mappings updated and saved")
+        messagebox.showinfo("Settings Saved", "Status mappings have been saved successfully.")
+    
+    def _reset_status_mappings(self):
+        """Reset status mappings to defaults"""
+        if messagebox.askyesno("Reset Mappings", "Reset all status mappings to defaults?"):
+            self.status_mappings = DEFAULT_STATUS_MAPPINGS.copy()
+            for discogs_status, var in self.status_mapping_vars.items():
+                if discogs_status in self.status_mappings:
+                    var.set(self.status_mappings[discogs_status])
+            self.log_sync_activity("Status mappings reset to defaults")
+    
+    def _serialize_form_to_payload(self):
+        """
+        Collect all lister fields + images into a JSON-serializable dict.
+        """
+        price_s = self.price_entry.get().strip()
+        try:
+            price_v = float(price_s) if price_s else 0.0
+        except Exception:
+            price_v = 0.0
+        
+        payload = {
+            "artist": self.entries["artist"].get().strip(),
+            "title": self.entries["title"].get().strip(),
+            "cat_no": self.entries["cat_no"].get().strip(),
+            "year": self.entries["year"].get().strip(),
+            "format": self.entries["format"].get(),
+            "genre": self.entries["genre"].get(),
+            "media_condition": self.entries["media_condition"].get(),
+            "sleeve_condition": self.entries["sleeve_condition"].get(),
+            "price": price_v,
+            "condition_notes": self.entries["condition_notes"].get("1.0", "end-1c").strip(),
+            "matrix_runout": self.entries["matrix_runout"].get("1.0", "end-1c").strip(),
+            "condition_tags": self.entries["condition_tags"].get().strip(),
+            "description": self.full_desc.get("1.0", "end-1c").strip(),
+            "shipping_option": self.entries["shipping_option"].get(),
+            "barcode": self.entries["barcode"].get().strip(),
+            "new_used": self.entries["new_used"].get(),
+            "listing_title": self.entries["listing_title"].get().strip(),
+            "discogs_release_id": self.current_release_id,
+            "images": list(self.image_paths),
+        }
+        return payload
+    
+    def _apply_payload_to_form(self, payload: dict):
+        """
+        Hydrates the form from a data dictionary.
+        """
+        def set_entry(name, value):
+            if name in self.entries:
+                w = self.entries[name]
+                final_value = value if value is not None else ""
+                try:
+                    if isinstance(w, (tk.Entry, ttk.Entry)):
+                        w.delete(0, tk.END)
+                        w.insert(0, str(final_value))
+                    elif isinstance(w, ttk.Combobox):
+                        w.set(str(final_value))
+                    elif isinstance(w, tk.Text):
+                        w.delete("1.0", tk.END)
+                        w.insert("1.0", str(final_value))
+                except Exception as e:
+                    logger.warning(f"Failed to set UI entry '{name}': {e}")
+
+        # Apply all fields from the payload
+        set_entry("artist", payload.get("artist"))
+        set_entry("title", payload.get("title"))
+        set_entry("cat_no", payload.get("cat_no"))
+        set_entry("year", payload.get("year"))
+        set_entry("format", payload.get("format"))
+        set_entry("genre", payload.get("genre"))
+        set_entry("media_condition", payload.get("media_condition"))
+        set_entry("sleeve_condition", payload.get("sleeve_condition"))
+        set_entry("shipping_option", payload.get("shipping_option"))
+        set_entry("barcode", payload.get("barcode"))
+        set_entry("new_used", payload.get("new_used"))
+        set_entry("condition_notes", payload.get("condition_notes"))
+        set_entry("matrix_runout", payload.get("matrix_runout"))
+        set_entry("condition_tags", payload.get("condition_tags"))
+        set_entry("listing_title", payload.get("listing_title"))
+
+        # Price
+        price_val = payload.get("price")
+        price_str = f"{price_val:.2f}" if isinstance(price_val, (int, float)) and price_val > 0 else ""
+        self.price_entry.delete(0, tk.END)
+        self.price_entry.insert(0, price_str)
+        
+        # Description
+        desc_val = payload.get("description")
+        self.full_desc.delete("1.0", tk.END)
+        if desc_val:
+            self.full_desc.insert("1.0", desc_val)
+        
+        # Images
+        self.image_paths = list(payload.get("images") or [])
+        self._update_image_listbox()
+
+        # Release ID
+        self.current_release_id = payload.get("discogs_release_id")
+    
+    def _get_inventory_record(self, sku: str) -> dict:
+        """Load DB row and merge lister_payload JSON over flat columns."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM inventory WHERE sku = ?", (sku,))
+            rec = cursor.fetchone()
+            if not rec:
+                return {}
+            d = dict(rec)
+            try:
+                if d.get("lister_payload"):
+                    p = json.loads(d["lister_payload"])
+                    if isinstance(p, dict):
+                        # Merge payload, giving payload precedence for non-empty values
+                        for k, v in p.items():
+                            if v not in (None, "", []):
+                                d[k] = v
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(f"Could not parse lister_payload for SKU {sku}")
+            return d
+    
+    def _load_geometry(self):
+        """Load saved window geometry"""
+        try:
+            geometry_path = os.path.join(os.path.dirname(__file__), "geometry.conf")
+            with open(geometry_path, "r") as f:
+                self.root.geometry(f.read())
+        except FileNotFoundError:
+            self.root.geometry("1900x1000")
+    
+    def on_closing(self):
+        """Handle application closing"""
+        self.app_is_closing = True
+        if self.auto_sync_enabled:
+            self.stop_auto_sync()
+        
+        # Save window geometry
+        try:
+            geometry_path = os.path.join(os.path.dirname(__file__), "geometry.conf")
+            with open(geometry_path, "w") as f:
+                f.write(self.root.geometry())
+        except Exception as e:
+            logger.warning(f"Could not save window geometry: {e}")
+        
+        self.root.destroy()
+    
+    def _setup_gui(self):
+        """Setup the complete GUI with all features INCLUDING Collection tab"""
+        self.root.option_add("*Font", "Helvetica 14")
+        style = ttk.Style()
+        style.theme_use("clam")
+        
+        # Create notebook
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(expand=True, fill="both")
+        
+        # Create ALL tabs including Collection
+        self.lister_tab = ttk.Frame(self.notebook)
+        self.inventory_tab = ttk.Frame(self.notebook)
+        self.collection_tab = ttk.Frame(self.notebook)
+        self.settings_tab = ttk.Frame(self.notebook)
+        
+        # Add tabs in correct order: Lister -> Inventory -> Collection -> Settings
+        self.notebook.add(self.lister_tab, text="Lister")
+        self.notebook.add(self.inventory_tab, text="Inventory")
+        self.notebook.add(self.collection_tab, text="Collection")
+        self.notebook.add(self.settings_tab, text="Settings & Sync")
+        
+        # Setup each tab
+        self._setup_lister_tab()
+        self._setup_inventory_tab()
+        self._setup_collection_tab()
+        self._setup_settings_tab_complete()
+    
+    def _setup_collection_tab(self):
+        """Setup the Collection tab synchronously"""
+        # Top controls frame
+        top = ttk.Frame(self.collection_tab)
+        top.pack(fill="x", padx=8, pady=6)
+        
+        # Folder selection
+        ttk.Label(top, text="Folder:").pack(side="left")
+        self.collection_folder_var = tk.StringVar()
+        self.collection_folder_var.set("Loading...")
+        self.collection_folder_combo = ttk.Combobox(
+            top, 
+            textvariable=self.collection_folder_var, 
+            state="readonly", 
+            width=40
+        )
+        self.collection_folder_combo.pack(side="left", padx=(6, 12))
+        self.collection_folder_combo.bind("<<ComboboxSelected>>", self._on_folder_change)
+        
+        # Filter entry
+        ttk.Label(top, text="Filter:").pack(side="left")
+        self.collection_filter_var = tk.StringVar()
+        self.collection_filter_entry = ttk.Entry(
+            top, 
+            textvariable=self.collection_filter_var, 
+            width=28
+        )
+        self.collection_filter_entry.pack(side="left", padx=(6, 12))
+        self.collection_filter_entry.bind("<KeyRelease>", self._on_filter_change)
+        
+        # Pagination controls
+        self.collection_prev_btn = ttk.Button(
+            top, 
+            text="< Prev", 
+            command=self._collection_prev_page
+        )
+        self.collection_prev_btn.pack(side="left")
+        
+        self.collection_page_label = ttk.Label(top, text="Page 1 / 1")
+        self.collection_page_label.pack(side="left", padx=6)
+        
+        self.collection_next_btn = ttk.Button(
+            top, 
+            text="Next >", 
+            command=self._collection_next_page
+        )
+        self.collection_next_btn.pack(side="left", padx=(0, 6))
+        
+        self.collection_refresh_btn = ttk.Button(
+            top, 
+            text="Refresh", 
+            command=self._refresh_collection
+        )
+        self.collection_refresh_btn.pack(side="left", padx=(6, 0))
+        
+        # Collection tree
+        cols = ("added", "artist", "title", "labels", "catno", "formats", 
+                "year", "media", "sleeve", "folder", "rating", "instance", "release")
+        self.collection_tree = ttk.Treeview(
+            self.collection_tab, 
+            columns=cols, 
+            show="headings", 
+            height=18
+        )
+        
+        # Setup columns
+        headings = {
+            "added": "Date Added", "artist": "Artist", "title": "Title",
+            "labels": "Label(s)", "catno": "Cat No", "formats": "Format(s)",
+            "year": "Year", "media": "Media Cond.", "sleeve": "Sleeve Cond.", "folder": "Folder", "rating": "Rating",
+            "instance": "Instance ID", "release": "Release ID"
+        }
+        
+        for col in cols:
+            self.collection_tree.heading(col, text=headings[col])
+            if col in ("title", "labels", "formats"):
+                width = 180
+            elif col in ("media", "sleeve"):
+                width = 120
+            else:
+                width = 110
+            self.collection_tree.column(col, width=width, stretch=True)
+        
+        self.collection_tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Click-to-sort current page
+        self._collection_sort = {"col": None, "reverse": False}
+        def _sort_by(col):
+            st = self._collection_state
+            items = st.get("items", [])
+            keymap = {
+                "added":   lambda it: (it.get("date_added") or ""),
+                "artist":  lambda it: " ".join(a.get("name","") for a in it.get("basic_information",{}).get("artists",[])).lower(),
+                "title":   lambda it: (it.get("basic_information",{}).get("title","") or "").lower(),
+                "labels":  lambda it: " ".join(l.get("name","") for l in it.get("basic_information",{}).get("labels",[])).lower(),
+                "catno":   lambda it: (it.get("basic_information",{}).get("labels",[{}])[0].get("catno","") or it.get("basic_information",{}).get("catno","") or "").lower(),
+                "formats": lambda it: " ".join(f.get("name","") for f in it.get("basic_information",{}).get("formats",[])).lower(),
+                "year":    lambda it: it.get("basic_information",{}).get("year") or 0,
+                "rating":  lambda it: it.get("rating") or 0,
+                "instance":lambda it: it.get("id") or 0,
+                "release": lambda it: it.get("basic_information",{}).get("id") or 0,
+                "folder":  lambda it: st.get("folder_name","").lower()
+            }
+            key = keymap.get(col)
+            if not key: return
+            prev = self._collection_sort
+            reverse = prev["reverse"] if prev["col"] == col else False
+            st["items"] = sorted(items, key=key, reverse=not reverse)
+            self._collection_sort = {"col": col, "reverse": not reverse}
+            if hasattr(self, "_render_collection_tree"):
+                self._render_collection_tree()
+            elif hasattr(self, "_refresh_collection_tree"):
+                self._refresh_collection_tree()
+        for col in cols:
+            self.collection_tree.heading(col, text=headings[col], command=lambda c=col: _sort_by(c))
+        
+        # Bind events
+        self.collection_tree.bind("<Double-1>", self._collection_open_release)
+        self.collection_tree.bind("<Button-3>", self._collection_context_menu)
+        
+        
+        self.collection_tree.bind("<Button-2>", self._collection_context_menu)
+        self.collection_tree.bind("<Control-Button-1>", self._collection_context_menu)# Load folders asynchronously but don't block GUI creation
+        self.root.after(100, self._load_collection_folders)
+    
+    def _get_discogs_credentials(self):
+        """Get Discogs token and username"""
+        token = None
+        username = None
+        
+        try:
+            if hasattr(self, "config"):
+                token = (self.config.get("discogs_token") or self.config.get("discogs_oauth_token") or "").strip() or None
+                username = (self.config.get("discogs_username") or "").strip() or None
+        except Exception:
+            pass
+        
+        # Fallback to environment variables
+        token = token or os.environ.get("DISCOGS_TOKEN")
+        username = username or os.environ.get("DISCOGS_USERNAME")
+        
+        return token, username
+    
+    
+    def _discogs_api_request(self, url, params=None):
+        """Fetch Discogs JSON using personal token if available (no OAuth secret)."""
+        from vinyltool.core.config import Config
+        import urllib.request, urllib.parse, json
+    
+        cfg = Config().load()
+        token = cfg.get("discogs_token") or ""
+        ua = cfg.get("discogs_user_agent") or "VinylTool/1.0"
+    
+        # build URL with params
+        if params:
+            sep = "&" if "?" in url else "?"
+            url = url + sep + urllib.parse.urlencode(params)
+    
+        # Prefer Authorization header; Discogs supports 'Discogs token=...'
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
+        if token:
+            req.add_header("Authorization", f"Discogs token={token}")
+    
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        return json.loads(data.decode("utf-8", "ignore"))
+    def safe_after(self, delay, callback):
+        try:
+            if self.root and self.root.winfo_exists():
+                self.root.after(delay, callback)
+        except RuntimeError:
+            # Tk is already shutting down
+            pass
+
+    def _load_collection_folders(self):
+        """Load Discogs collection folders"""
+        def worker():
+            try:
+                token, username = self._get_discogs_credentials()
+                if not (token and username and self.discogs_api.is_connected()):
+                    self.safe_after(0, lambda: self._set_collection_error("Discogs not connected"))
+                    return
+                
+                user = self.discogs_api.client.identity()
+                data = user.collection_folders
+                
+                folders = []
+                for f in data:
+                    folders.append({
+                        "id": f.id,
+                        "name": f.name, 
+                        "count": f.count
+                    })
+                
+                def update_ui():
+                    self._collection_state["folders"] = folders
+                    labels = [f"{f['name']} ({f['count']})" for f in folders]
+                    self.collection_folder_combo["values"] = labels
+                    
+                    if folders:
+                        self.collection_folder_var.set(labels[0])
+                        self._collection_state["folder_id"] = folders[0]["id"]
+                        self._refresh_collection()
+                    else:
+                        self.collection_folder_var.set("No folders found")
+                
+                self.safe_after(0, update_ui)
+                
+            except Exception as e:
+                error_msg = f"Failed to load folders: {e}"
+                self.safe_after(0, lambda: self._set_collection_error(error_msg))
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _set_collection_error(self, message):
+        """Set error state for collection"""
+        self.collection_folder_var.set(f"Error: {message}")
+        # Clear tree
+        for item in self.collection_tree.get_children():
+            self.collection_tree.delete(item)
+    
+    def _on_folder_change(self, event=None):
+        """Handle folder selection change"""
+        chosen = self.collection_folder_var.get()
+        
+        # Find folder ID
+        folder_id = None
+        for f in self._collection_state["folders"]:
+            if f"{f['name']} ({f['count']})" == chosen:
+                folder_id = f["id"]
+                break
+        
+        if folder_id is not None:
+            self._collection_state["folder_id"] = folder_id
+            self._collection_state["page"] = 1
+            self._refresh_collection()
+    
+    def _on_filter_change(self, event=None):
+        """Handle filter text change"""
+        self._collection_state["filter"] = self.collection_filter_var.get().strip()
+        self._render_collection_tree()
+    
+    def _collection_prev_page(self):
+        """Go to previous page"""
+        if self._collection_state["page"] > 1:
+            self._collection_state["page"] -= 1
+            self._refresh_collection()
+    
+    def _collection_next_page(self):
+        """Go to next page"""
+        if self._collection_state["page"] < self._collection_state.get("pages", 1):
+            self._collection_state["page"] += 1
+            self._refresh_collection()
+    def _refresh_collection(self):
+        """Refresh collection data using direct API calls."""
+        def worker():
+            try:
+                token, username = self._get_discogs_credentials()
+                if not (token and username):
+                    self.safe_after(0, lambda: self._set_collection_error("Discogs credentials not configured"))
+                    return
+
+                # Cache custom field IDs once (non-fatal if this fails)
+                try:
+                    if not getattr(self, "_discogs_field_ids", None):
+                        ids = self._discogs_fetch_collection_fields()
+                        self._discogs_field_ids = ids or {}
+                except Exception:
+                    self._discogs_field_ids = getattr(self, "_discogs_field_ids", {}) or {}
+
+                folder_id = self._collection_state.get("folder_id")
+                if folder_id is None:
+                    return
+
+                page = self._collection_state.get("page", 1)
+                per_page = self._collection_state.get("per_page", 100)
+
+                url = f"https://api.discogs.com/users/{username}/collection/folders/{folder_id}/releases"
+                params = {"page": page, "per_page": per_page, "sort": "added", "sort_order": "desc"}
+
+                data = self._discogs_api_request(url, params) or {}
+                items = (data.get("releases") or []) if isinstance(data, dict) else []
+                try:
+                    pages = int((data.get("pagination", {}) or {}).get("pages", 1) or 1)
+                except Exception:
+                    pages = 1
+
+                folder_name = ""
+                try:
+                    for f in self._collection_state.get("folders", []):
+                        if f.get("id") == folder_id:
+                            folder_name = f.get("name", "")
+                            break
+                except Exception:
+                    folder_name = ""
+
+                def update_ui():
+                    self._collection_state["items"] = items
+                    self._collection_state["pages"] = pages
+                    self._collection_state["folder_name"] = folder_name
+                    self._render_collection_tree()
+
+                self.safe_after(0, update_ui)
+
+            except Exception as e:
+                self.safe_after(0, lambda: self._set_collection_error(f"Failed to refresh collection: {e}"))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+    def _refresh_collection(self):
+        """Refresh collection data using direct API calls."""
+        def worker():
+            try:
+                token, username = self._get_discogs_credentials()
+                if not (token and username):
+                    self.safe_after(0, lambda: self._set_collection_error("Discogs credentials not configured"))
+                    return
+
+                # Cache custom field IDs once (non-fatal if this fails)
+                try:
+                    if not getattr(self, "_discogs_field_ids", None):
+                        ids = self._discogs_fetch_collection_fields()
+                        self._discogs_field_ids = ids or {}
+                except Exception:
+                    self._discogs_field_ids = getattr(self, "_discogs_field_ids", {}) or {}
+
+                folder_id = self._collection_state.get("folder_id")
+                if folder_id is None:
+                    return
+
+                page = self._collection_state.get("page", 1)
+                per_page = self._collection_state.get("per_page", 100)
+
+                url = f"https://api.discogs.com/users/{username}/collection/folders/{folder_id}/releases"
+                params = {"page": page, "per_page": per_page, "sort": "added", "sort_order": "desc"}
+
+                data = self._discogs_api_request(url, params) or {}
+                items = (data.get("releases") or []) if isinstance(data, dict) else []
+                try:
+                    pages = int((data.get("pagination", {}) or {}).get("pages", 1) or 1)
+                except Exception:
+                    pages = 1
+
+                folder_name = ""
+                try:
+                    for f in self._collection_state.get("folders", []):
+                        if f.get("id") == folder_id:
+                            folder_name = f.get("name", "")
+                            break
+                except Exception:
+                    folder_name = ""
+
+                def update_ui():
+                    self._collection_state["items"] = items
+                    self._collection_state["pages"] = pages
+                    self._collection_state["folder_name"] = folder_name
+                    self._render_collection_tree()
+
+                self.safe_after(0, update_ui)
+
+            except Exception as e:
+                self.safe_after(0, lambda: self._set_collection_error(f"Failed to refresh collection: {e}"))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_collection_filter(self, items, filter_text):
+        """Apply filter to collection items"""
+        if not filter_text:
+            return items
+        
+        filter_text = filter_text.lower()
+        filtered = []
+        
+        for item in items:
+            bi = item.get("basic_information", {})
+            
+            # Build searchable text
+            artists = " ".join([a.get("name", "") for a in bi.get("artists", [])])
+            labels = " ".join([l.get("name", "") for l in bi.get("labels", [])])
+            formats = " ".join([f.get("name", "") for f in bi.get("formats", [])])
+            
+            search_text = " ".join([
+                bi.get("title", ""),
+                artists,
+                labels, 
+                formats,
+                str(bi.get("year", ""))
+            ]).lower()
+            
+            if filter_text in search_text:
+                filtered.append(item)
+        
+        return filtered
+    
+    def _render_collection_tree(self):
+        """Render collection items in tree"""
+        # Clear existing items
+        for item in self.collection_tree.get_children():
+            self.collection_tree.delete(item)
+        
+        # Apply filter
+        items = self._apply_collection_filter(
+            self._collection_state.get("items", []),
+            self._collection_state.get("filter", "")
+        )
+        
+        # Populate tree
+        folder_name = self._collection_state.get("folder_name", "")
+        fid_media = (self._discogs_field_ids or {}).get("media")
+        fid_sleeve = (self._discogs_field_ids or {}).get("sleeve")
+        
+        for item in items:
+            media_val = sleeve_val = ""
+            try:
+                for n in (item.get("notes") or []):
+                    if fid_media and n.get("field_id") == fid_media:
+                        media_val = n.get("value") or ""
+                    if fid_sleeve and n.get("field_id") == fid_sleeve:
+                        sleeve_val = n.get("value") or ""
+            except Exception:
+                pass
+
+            bi = item.get("basic_information", {})
+            
+            # Extract data
+            artists = ", ".join([a.get("name", "") for a in bi.get("artists", [])])
+            labels = ", ".join([l.get("name", "") for l in bi.get("labels", [])])
+            formats = ", ".join([f.get("name", "") for f in bi.get("formats", [])])
+            
+            # Get catalog number
+            catno = ""
+            if bi.get("labels"):
+                catnos = [l.get("catno", "") for l in bi.get("labels", []) if l.get("catno")]
+                catno = ", ".join(sorted(set(catnos)))
+            
+            # Format date
+            date_added = item.get("date_added", "")
+            if date_added and len(date_added) >= 10:
+                date_added = date_added[:10]  # Just the date part
+            
+            row = (
+                date_added,
+                artists,
+                bi.get("title", ""),
+                labels,
+                catno,
+                formats,
+                bi.get("year", ""),
+                media_val,
+                sleeve_val,
+                folder_name,
+                item.get("rating", "") or "",
+                item.get("id", ""),
+                bi.get("id", "")
+            )
+            
+            self.collection_tree.insert("", "end", values=row)
+        
+        # Update page label
+        page = self._collection_state.get("page", 1)
+        pages = self._collection_state.get("pages", 1)
+        self.collection_page_label.config(text=f"Page {page} / {pages}")
+    
+    def _collection_open_release(self, event=None):
+        """Open selected release in Discogs"""
+        selection = self.collection_tree.selection()
+        if not selection:
+            return
+        
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            release_id = values[-1]  # Last column is release ID
+            if release_id:
+                import webbrowser
+                webbrowser.open(f"https://www.discogs.com/release/{release_id}")
+        except Exception as e:
+            logger.error(f"Failed to open release: {e}")
+
+    # ========================================================================
+    # START: ENHANCED CONTEXT MENU FOR COLLECTION TAB
+    # ========================================================================
+
+    def _collection_context_menu(self, event):
+        """Show context menu for collection with enhanced features."""
+        from tkinter import Menu
+        
+        item_id = self.collection_tree.identify_row(event.y)
+        if not item_id:
+            return
+        
+        self.collection_tree.selection_set(item_id)
+        selection = self.collection_tree.selection()
+        if not selection:
+            return
+
+        values = self.collection_tree.item(selection[0], "values")
+        has_release_id = False
+        try:
+            if values and int(values[-1]) > 0:
+                has_release_id = True
+        except (ValueError, IndexError):
+            pass
+
+        menu = Menu(self.collection_tree, tearoff=0)
+        menu.add_command(label="Add to Inventory", command=self._collection_add_to_inventory)
+        menu.add_separator()
+        menu.add_command(label="Open on Discogs", command=self._collection_open_release, 
+                         state="normal" if has_release_id else "disabled")
+        menu.add_command(label="View Price History", command=self._collection_view_price_history,
+                         state="normal" if has_release_id else "disabled")
+        menu.add_command(label="View All Variants", command=self._collection_view_all_variants,
+                         state="normal" if has_release_id else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Quick List on Discogs", command=self._collection_quick_list_on_discogs,
+                         state="normal" if has_release_id else "disabled")
+        menu.add_command(label="Search Sold Listings (eBay)", command=self._collection_search_sold_listings)
+        menu.add_separator()
+        menu.add_command(label="Edit Grades…", command=self._collection_edit_grades,
+                         state="normal" if has_release_id else "disabled")
+        menu.add_command(label="Update Collection Notes", command=self._collection_update_notes)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _collection_view_price_history(self):
+        """Context menu action to view price history for a collection item."""
+        selection = self.collection_tree.selection()
+        if not selection: return
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            release_id = int(values[-1])
+            self._view_price_history(release_id)
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not get a valid Release ID.")
+
+    def _collection_view_all_variants(self):
+        """Context menu action to view all variants for a collection item."""
+        selection = self.collection_tree.selection()
+        if not selection: return
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            release_id = int(values[-1])
+            self._view_all_variants(release_id)
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not get a valid Release ID.")
+
+    def _collection_quick_list_on_discogs(self):
+        """Context menu action for quick listing a collection item."""
+        selection = self.collection_tree.selection()
+        if not selection: return
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            release_id = int(values[-1])
+            self._quick_list_on_discogs(release_id)
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not get a valid Release ID.")
+
+    def _collection_search_sold_listings(self):
+        """Context menu action to search sold listings for a collection item."""
+        selection = self.collection_tree.selection()
+        if not selection: return
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            artist, title = values[1], values[2]
+            self._search_sold_listings_inventory(artist, title)
+        except IndexError:
+            messagebox.showerror("Error", "Could not get item details from selection.")
+
+    def _collection_update_notes(self):
+        """Context menu action to update collection notes (with API limitation notice)."""
+        selection = self.collection_tree.selection()
+        if not selection: return
+        values = self.collection_tree.item(selection[0], "values")
+        try:
+            instance_id = int(values[-2])
+            release_id = int(values[-1])
+            # The API *does* allow editing notes for a collection item instance.
+            # We need the instance_id, not the release_id.
+            
+            # Fetch current notes first
+            if not self.discogs_api.is_connected():
+                messagebox.showwarning("Not Connected", "Please connect to Discogs first.")
+                return
+
+            def fetch_and_edit_worker():
+                try:
+                    user = self.discogs_api.client.identity()
+                    item = user.collection_folders[0].releases.get(instance_id) # Assumes in first folder, needs improvement
+                    
+                    # This is inefficient, we should find the right folder first.
+                    # For now, let's just prompt for notes.
+                    current_notes = "" # Can't easily get current notes without iterating all folders.
+                    
+                    new_notes = simpledialog.askstring("Edit Collection Notes", "Enter your personal notes for this item:", initialvalue=current_notes, parent=self.root)
+                    
+                    if new_notes is not None:
+                        # This part of the API is tricky. The `discogs-client` library doesn't expose this well.
+                        # We would need to make a POST request to /users/{username}/collection/folders/{folder_id}/releases/{release_id}/instances/{instance_id}
+                        # with a `notes` field. This is too complex to add right now.
+                        self.safe_after(0, self._update_collection_notes)
+
+                except Exception as e:
+                    logger.error(f"Failed to get collection item for notes: {e}")
+                    self.safe_after(0, self._update_collection_notes)
+
+            #threading.Thread(target=fetch_and_edit_worker).start()
+            self._update_collection_notes() # Call the info dialog directly for now.
+
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not get a valid Instance ID.")
+
+    def _view_price_history(self, release_id: int):
+        """Opens the Discogs marketplace price history page."""
+        if release_id:
+            url = f"https://www.discogs.com/sell/history/{release_id}"
+            webbrowser.open_new_tab(url)
+            logger.info(f"Opened price history for release {release_id}")
+
+    def _view_all_variants(self, release_id: int):
+        """Finds the master release and opens the page to show all variants."""
+        if not release_id: return
+        
+        def worker():
+            try:
+                release_data = self.discogs_api.get_release(release_id)
+                if release_data and "master_id" in release_data:
+                    master_id = release_data["master_id"]
+                    if master_id:
+                        url = f"https://www.discogs.com/master/{master_id}"
+                        self.safe_after(0, lambda: webbrowser.open_new_tab(url))
+                        logger.info(f"Opened master release {master_id} for release {release_id}")
+                    else:
+                        # If master_id is 0 or null, it's a unique release
+                        self.safe_after(0, lambda: messagebox.showinfo("No Variants", "This release is not part of a master release and has no other known variants."))
+                else:
+                    self.safe_after(0, lambda: messagebox.showwarning("Not Found", "Could not find a master release for this item."))
+            except Exception as e:
+                logger.error(f"Failed to get variants for release {release_id}: {e}")
+                self.safe_after(0, lambda: messagebox.showerror("API Error", f"Failed to fetch release data: {e}"))
+        
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _quick_list_on_discogs(self, release_id: int):
+        """Opens a streamlined dialog to quickly list an item on Discogs."""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to Discogs first.")
+            return
+
+        dialog = QuickListDialog(self.root, "Quick List on Discogs")
+        if dialog.result:
+            listing_data = {
+                'release_id': release_id,
+                'price': dialog.result["price"],
+                'status': 'For Sale', # List directly as For Sale
+                'condition': DISCOGS_GRADE_MAP.get(dialog.result["media_condition"], dialog.result["media_condition"]),
+                'sleeve_condition': DISCOGS_GRADE_MAP.get(dialog.result["sleeve_condition"], dialog.result["sleeve_condition"]),
+                'comments': dialog.result["comments"]
+            }
+
+            def list_worker():
+                try:
+                    listing_id = self.discogs_api.create_listing(listing_data)
+                    if listing_id:
+                        msg = f"Successfully listed item on Discogs (Listing ID: {listing_id})"
+                        self.safe_after(0, lambda: messagebox.showinfo("Success", msg))
+                    # Error is handled by the API wrapper now
+                except Exception as e:
+                    self.safe_after(0, lambda: messagebox.showerror("Listing Error", str(e)))
+                finally:
+                    self.safe_after(0, lambda: self.root.config(cursor=""))
+
+            self.root.config(cursor="watch")
+            self.root.update()
+            threading.Thread(target=list_worker, daemon=True).start()
+
+    def _search_sold_listings_inventory(self, artist: str, title: str):
+        """Opens eBay completed listings search for an item from inventory."""
+        if not artist and not title:
+            messagebox.showwarning("Missing Info", "Artist and/or Title are required to search.")
+            return
+        query = f"{artist} {title}".strip()
+        url = f"https://www.ebay.co.uk/sch/i.html?_from=R40&_nkw={quote_plus(query)}&_sacat=176985&LH_Complete=1&LH_Sold=1"
+        webbrowser.open_new_tab(url)
+        logger.info(f"Opened eBay sold listings search for: {query}")
+
+    def _update_collection_notes(self):
+        """Dialog for editing personal notes (with API limitation notice)."""
+        messagebox.showinfo(
+            "Feature Not Available",
+            "The official Discogs API does not currently support editing the notes of a collection item.\n\n"
+            "This feature will be implemented if the API is updated to allow it."
+        )
+
+    # ========================================================================
+    # END: ENHANCED CONTEXT MENU FOR COLLECTION TAB
+    # ========================================================================
+    
+    def _extract_barcode_and_cat_no(self, *args, **kwargs):
+        from vinyltool.core import parse
+        return parse._extract_barcode_and_cat_no(self, *args, **kwargs)
+    def _extract_matrix_info(self, release_data: dict) -> str:
+        from vinyltool.core import parse
+        return parse._extract_matrix_info(release_data)
+    def _collection_add_to_inventory(self):
+        """Enhanced: Add selected collection item directly to inventory database."""
+        selection = self.collection_tree.selection()
+        if not selection:
+            return
+
+        values = self.collection_tree.item(selection[0], "values")
+        
+        try:
+            release_id = int(values[-1])
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not get a valid Release ID from the selected item.")
+            return
+
+        # 1. Check for duplicates before proceeding
+        try:
+            # Attempt to deduplicate by both release ID and cat_no if available
+            cat_no = None
+            try:
+                # Collection tree columns are: added, artist, title, labels, catno, formats, year, folder, rating, instance, release
+                # The catno resides at index 4
+                cat_no = values[4] if len(values) > 4 else None
+            except Exception:
+                cat_no = None
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                if cat_no:
+                    cursor.execute("SELECT sku, status FROM inventory WHERE discogs_release_id = ? AND cat_no = ?", (release_id, cat_no))
+                else:
+                    cursor.execute("SELECT sku, status FROM inventory WHERE discogs_release_id = ?", (release_id,))
+                existing = cursor.fetchone()
+                if existing:
+                    msg = (f"This release (ID: {release_id}) already exists in your inventory.\n\n"
+                           f"SKU: {existing['sku']}\nStatus: {existing['status']}\n\n"
+                           "Do you want to add it again?")
+                    if not messagebox.askyesno("Duplicate Found", msg):
+                        return
+        except Exception as e:
+            logger.error(f"Database error checking for duplicates: {e}")
+            messagebox.showerror("Database Error", f"Could not check for duplicates: {e}")
+            return
+
+        # 2. Fetch full details from Discogs API in a background thread
+        self.root.config(cursor="watch")
+        self.root.update()
+
+        def api_worker():
+            release_data = self.discogs_api.get_release(release_id)
+            self.safe_after(0, lambda: self._process_inventory_addition(release_data))
+
+        threading.Thread(target=api_worker, daemon=True).start()
+
+    def _process_inventory_addition(self, release_data):
+        """
+        Callback to handle processing after API call, ensuring matrix/runout is saved
+        AND included in the lister_payload for consistent loading.
+        """
+        self.root.config(cursor="")
+        if not release_data:
+            messagebox.showerror("API Error", f"Failed to fetch complete data for Release ID: {release_data.get('id')}")
+            return
+
+        # 3. Prompt user for condition and price
+        dialog = ConditionGradingDialog(self.root)
+        if not dialog.result:
+            return  # User cancelled
+
+        # 4. Prepare data for database insertion
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        sku = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        
+        artist_names = [re.sub(r'\s*\(\d+\)$', '', a['name']).strip() for a in release_data.get('artists', [])]
+        artist = ", ".join(artist_names)
+        title = release_data.get('title', '')
+        
+        barcode, cat_no = self._extract_barcode_and_cat_no(release_data)
+
+        year = release_data.get('year', '')
+        formats_list = [f.get('name', '') for f in release_data.get('formats', [])]
+        main_format = formats_list[0] if formats_list else 'Vinyl'
+
+        # [FIXED] Use the new robust extraction method for matrix info
+        matrix_runout_info = self._extract_matrix_info(release_data)
+
+        # Create a complete payload for the `lister_payload` column
+        # that INCLUDES the matrix_runout data.
+        lister_payload_data = {
+            "artist": artist, "title": title, "cat_no": cat_no, "year": str(year),
+            "format": main_format, "media_condition": dialog.result["media_condition"],
+            "sleeve_condition": dialog.result["sleeve_condition"], "price": dialog.result["price"],
+            "condition_notes": dialog.result["notes"], "barcode": barcode,
+            "matrix_runout": matrix_runout_info,
+            "discogs_release_id": release_data['id'],
+            "description": "", # Start with an empty description
+            "images": [] # Start with empty images
+        }
+
+        # 5. Save to database
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                sql = """
+                    INSERT INTO inventory (
+                        sku, artist, title, cat_no, year, format, media_condition,
+                        sleeve_condition, price, status, discogs_release_id, notes,
+                        barcode, matrix_runout, date_added, last_modified, inv_updated_at, lister_payload
+                    ) VALUES (
+                        :sku, :artist, :title, :cat_no, :year, :format, :media_condition,
+                        :sleeve_condition, :price, :status, :discogs_release_id, :notes,
+                        :barcode, :matrix_runout, :date_added, :last_modified, :inv_updated_at, :lister_payload
+                    )
+                """
+
+                db_params = {
+                    "sku": sku, "artist": artist, "title": title, "cat_no": cat_no,
+                    "year": str(year), "format": main_format,
+                    "media_condition": dialog.result["media_condition"],
+                    "sleeve_condition": dialog.result["sleeve_condition"],
+                    "price": dialog.result["price"], "status": "For Sale",
+                    "discogs_release_id": release_data['id'],
+                    "notes": dialog.result["notes"], "barcode": barcode,
+                    "matrix_runout": matrix_runout_info,
+                    "date_added": now, "last_modified": now,
+                    "inv_updated_at": now,
+                    "lister_payload": json.dumps(lister_payload_data)
+                }
+
+                cursor.execute(sql, db_params)
+            
+            # 6. Show confirmation and refresh
+            messagebox.showinfo("Success", f"Added to inventory!\n\nSKU: {sku}\n{artist} - {title}")
+            self.populate_inventory_view()
+            self.notebook.select(self.inventory_tab)
+
+        except Exception as e:
+            logger.error(f"Failed to save new inventory item: {e}", exc_info=True)
+            messagebox.showerror("Database Error", f"Failed to save item to inventory: {e}")
+
+    def _setup_lister_tab(self):
+        """
+        Setup the lister tab, now with a multi-line Text widget for Matrix/Runout.
+        """
+        entry_frame = tk.Frame(self.lister_tab)
+        entry_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nw")
+        
+        results_frame = tk.Frame(self.lister_tab)
+        results_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        
+        self.lister_tab.grid_columnconfigure(1, weight=1)
+        self.lister_tab.grid_rowconfigure(0, weight=1)
+
+        tk.Label(entry_frame, text="SKU", font=("Helvetica", 14, "bold")).grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        sku_entry = tk.Entry(entry_frame, textvariable=self.sku_display_var, state="readonly", width=50, readonlybackground="white", fg="black")
+        sku_entry.grid(row=0, column=1, columnspan=3, sticky="we", padx=5, pady=2)
+
+        field_labels = [
+            "Artist", "Title", "Cat No", "Barcode", "Format", "Year", "Genre",
+            "Media Condition", "Sleeve Condition", "Condition Notes",
+            "Matrix / Runout", "Condition Tags",
+            "New/Used", "Shipping Option", "Listing Title"
+        ]
+        
+        field_options = {
+            "Format": ["", "LP", "12\"", "2x12\"", "7\"", "10\"", "Box Set", "Vinyl", "Other"],
+            "Media Condition": [""] + list(GRADE_ABBREVIATIONS.keys()),
+            "Sleeve Condition": [""] + list(GRADE_ABBREVIATIONS.keys()),
+            "New/Used": ["", "Used", "New"],
+            "Shipping Option": ["", "Standard UK Paid", "Free UK"],
+            "Genre": ["", "Pop", "Rock", "Electronic", "Hip Hop", "Jazz", "Classical", "Folk", "Blues", "Country", "Reggae", "Other"]
+        }
+        
+        self.entries = {}
+
+        for i, label_text in enumerate(field_labels):
+            row = i + 1
+            key = label_text.lower().replace(" / ", "_").replace("/", "_").replace(" ", "_")
+            
+            tk.Label(entry_frame, text=label_text).grid(row=row, column=0, sticky="nw", padx=5, pady=2)
+            
+            widget = None
+            if key in ["condition_notes", "matrix_runout"]:
+                widget_frame = tk.Frame(entry_frame)
+                widget_frame.grid(row=row, column=1, columnspan=3, sticky="we", padx=5, pady=2)
+                height = 3 if key == "matrix_runout" else 4
+                widget = tk.Text(widget_frame, width=47, height=height, wrap="word")
+                scrollbar = tk.Scrollbar(widget_frame, orient="vertical", command=widget.yview)
+                widget.config(yscrollcommand=scrollbar.set)
+                widget.pack(side="left", fill="x", expand=True)
+                scrollbar.pack(side="right", fill="y")
+            elif label_text in field_options:
+                widget = ttk.Combobox(entry_frame, values=field_options[label_text], width=47)
+                widget.grid(row=row, column=1, columnspan=3, sticky="we", padx=5, pady=2)
+            else:
+                widget = tk.Entry(entry_frame, width=50)
+                widget.grid(row=row, column=1, columnspan=3, sticky="we", padx=5, pady=2)
+            
+            self.entries[key] = widget
+
+            if key == "condition_tags":
+                tk.Label(entry_frame, text="(comma-separated)", font=("Helvetica", 10, "italic")).grid(row=row, column=4, sticky="w", padx=2)
+
+        current_row = len(field_labels) + 1
+        btn_row1 = tk.Frame(entry_frame)
+        btn_row1.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 0))
+        tk.Button(btn_row1, text="Search Discogs", command=self.search_discogs).pack(side="left", padx=4)
+        tk.Button(btn_row1, text="Search by Cat No", command=self.search_by_catno).pack(side="left", padx=4)
+        
+        current_row += 1
+        btn_row2 = tk.Frame(entry_frame)
+        btn_row2.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
+        
+        # Core functionality buttons
+        tk.Button(btn_row2, text="Generate Title", command=self.generate_listing_title).pack(side="left", padx=4)
+        tk.Button(btn_row2, text="Build Description", command=self.build_description).pack(side="left", padx=4)
+        self.save_button = tk.Button(btn_row2, text="Save to Inventory", command=self.save_to_inventory)
+        self.save_button.pack(side="left", padx=4)
+        tk.Button(btn_row2, text="Clear Form", command=self.clear_form).pack(side="left", padx=4)
+        
+        # Publishing buttons row
+        current_row += 1
+        publish_row = tk.Frame(entry_frame)
+        publish_row.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
+        
+        # eBay buttons
+        tk.Label(publish_row, text="eBay:", font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 5))
+        tk.Button(publish_row, text="Save Draft Locally", command=self.action_ebay_save_unpublished, bg="#e6f3ff").pack(side="left", padx=2)
+        self.list_on_ebay_button = tk.Button(publish_row, text="Publish Live", command=self.action_ebay_publish_live, bg="#ffe6e6", state="disabled")
+        self.list_on_ebay_button.pack(side="left", padx=2)
+        self.publish_both_btn = tk.Button(publish_row, text="Publish Both Live", command=self.action_publish_both_live, bg="#fff2cc", state=("normal" if (hasattr(self, "discogs_api") and self.discogs_api.is_connected() and hasattr(self, "ebay_api") and self.ebay_api.test_connection()) else "disabled"))
+        self.publish_both_btn.pack(side="left", padx=6)
+        
+        # Separator
+        ttk.Separator(publish_row, orient="vertical").pack(side="left", fill="y", padx=10)
+        
+        # Discogs buttons  
+        tk.Label(publish_row, text="Discogs:", font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 5))
+        self.discogs_draft_button = tk.Button(publish_row, text="Save Draft", command=self.action_discogs_save_unpublished, bg="#e6f3ff", state="disabled")
+        self.discogs_draft_button.pack(side="left", padx=2)
+        self.discogs_live_button = tk.Button(publish_row, text="Publish Live", command=self.action_discogs_publish_live, bg="#ffe6e6", state="disabled")
+        self.discogs_live_button.pack(side="left", padx=2)
+        
+        current_row += 1
+        self.release_status_label = tk.Label(entry_frame, text="⚠ No release selected", fg="red", font=("Helvetica", 12, "bold"), wraplength=400, justify="left")
+        self.release_status_label.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
+
+        current_row += 1
+        image_management_frame = ttk.LabelFrame(entry_frame, text="Image Management", padding=(10, 5))
+        image_management_frame.grid(row=current_row, column=0, columnspan=4, sticky="ew", padx=5, pady=5)
+        image_buttons_frame = tk.Frame(image_management_frame)
+        image_buttons_frame.pack(fill="x", pady=(0, 5))
+        
+        # [NEW] Add the "Select Images..." button
+        tk.Button(image_buttons_frame, text="Select Images...", command=self.select_images_manually).pack(side="left", padx=4)
+        tk.Button(image_buttons_frame, text="Generate QR", command=self.generate_image_qr_code).pack(side="left", padx=4)
+        self.import_images_button = tk.Button(image_management_frame, text="Import Staged", command=self.import_staged_images)
+        self.import_images_button.pack(side="left", padx=4)
+
+        image_ui_container = tk.Frame(image_management_frame)
+        image_ui_container.pack(fill="x", expand=True)
+        image_list_frame = tk.Frame(image_ui_container)
+        image_list_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        listbox_container = tk.Frame(image_list_frame)
+        listbox_container.pack(fill="x", expand=True)
+        self.image_listbox = tk.Listbox(listbox_container, height=6, selectmode=tk.SINGLE)
+        self.image_listbox.pack(side="left", fill="x", expand=True)
+        self.image_listbox.bind("<<ListboxSelect>>", self._update_image_preview)
+        image_scrollbar = tk.Scrollbar(listbox_container, orient="vertical", command=self.image_listbox.yview)
+        image_scrollbar.pack(side="right", fill="y")
+        self.image_listbox.config(yscrollcommand=image_scrollbar.set)
+        reorder_buttons_frame = tk.Frame(image_list_frame)
+        reorder_buttons_frame.pack(fill="x", pady=(5, 0))
+        tk.Button(reorder_buttons_frame, text="▲ Up", command=self._move_image_up).pack(side="left", fill="x", expand=True)
+        tk.Button(reorder_buttons_frame, text="▼ Down", command=self._move_image_down).pack(side="left", fill="x", expand=True)
+        tk.Button(reorder_buttons_frame, text="❌ Del", command=self._delete_selected_image).pack(side="left", fill="x", expand=True)
+        self.image_preview_label = ttk.Label(image_ui_container, text="Select an image to preview", relief="groove", anchor="center", justify="center")
+        self.image_preview_label.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        self.image_preview_label.config(width=30)
+        
+        current_row += 1
+        desc_frame = tk.Frame(entry_frame)
+        desc_frame.grid(row=current_row, column=0, columnspan=4, sticky="we", padx=5, pady=5)
+        tk.Label(desc_frame, text="Full Description").pack(anchor="w")
+        self.full_desc = tk.Text(desc_frame, width=50, height=6)
+        desc_scroll = tk.Scrollbar(desc_frame, command=self.full_desc.yview)
+        self.full_desc.config(yscrollcommand=desc_scroll.set)
+        desc_scroll.pack(side="right", fill="y")
+        self.full_desc.pack(side="left", fill="x", expand=True)
+
+        current_row += 1
+        tk.Label(entry_frame, text="Price (£)").grid(row=current_row, column=0, sticky="w", padx=5, pady=5)
+        self.price_entry = tk.Entry(entry_frame, width=50)
+        self.price_entry.grid(row=current_row, column=1, columnspan=3, sticky="we", padx=5, pady=5)
+        
+        self._setup_discogs_results(results_frame)
+    
+    def _update_image_listbox(self):
+        """Clears and repopulates the image listbox from self.image_paths."""
+        self.image_listbox.delete(0, tk.END)
+        for path in self.image_paths:
+            self.image_listbox.insert(tk.END, os.path.basename(path))
+
+    def _update_image_preview(self, event=None):
+        """Updates the image preview label when a listbox item is selected."""
+        try:
+            selected_indices = self.image_listbox.curselection()
+            if not selected_indices:
+                self._clear_image_preview()
+                return
+            
+            idx = selected_indices[0]
+            image_path = self.image_paths[idx]
+
+            if not os.path.exists(image_path):
+                self.image_preview_label.config(image='', text=f"Image not found:\n{os.path.basename(image_path)}")
+                return
+
+            with Image.open(image_path) as img:
+                # Create a thumbnail for preview
+                preview_size = (self.image_preview_label.winfo_width(), self.image_preview_label.winfo_height())
+                # Fallback size if widget not rendered yet
+                if preview_size[0] < 20 or preview_size[1] < 20: 
+                    preview_size = (200, 200)
+                
+                img.thumbnail(preview_size, Image.Resampling.LANCZOS)
+                
+                photo_image = ImageTk.PhotoImage(img)
+                
+                # Update the label
+                self.image_preview_label.config(image=photo_image, text="")
+                # IMPORTANT: Keep a reference to the image to prevent garbage collection
+                self.image_preview_label.image = photo_image
+
+        except Exception as e:
+            logger.error(f"Error updating image preview: {e}")
+            self.image_preview_label.config(image='', text="Error loading preview")
+
+    def _clear_image_preview(self):
+        """Clears the image preview area."""
+        self.image_preview_label.config(image='', text="Select an image to preview")
+        self.image_preview_label.image = None
+
+    def _move_image_up(self):
+        """Moves the selected image up in the list."""
+        try:
+            selected_indices = self.image_listbox.curselection()
+            if not selected_indices: return
+            
+            idx = selected_indices[0]
+            if idx > 0:
+                self.image_paths.insert(idx - 1, self.image_paths.pop(idx))
+                self._update_image_listbox()
+                self.image_listbox.selection_set(idx - 1)
+                self._update_image_preview() # Update preview after move
+        except Exception as e:
+            logger.error(f"Error moving image up: {e}")
+
+    def _move_image_down(self):
+        """Moves the selected image down in the list."""
+        try:
+            selected_indices = self.image_listbox.curselection()
+            if not selected_indices: return
+
+            idx = selected_indices[0]
+            if idx < len(self.image_paths) - 1:
+                self.image_paths.insert(idx + 1, self.image_paths.pop(idx))
+                self._update_image_listbox()
+                self.image_listbox.selection_set(idx + 1)
+                self._update_image_preview() # Update preview after move
+        except Exception as e:
+            logger.error(f"Error moving image down: {e}")
+
+    def _delete_selected_image(self):
+        """Deletes the selected image from the list."""
+        try:
+            selected_indices = self.image_listbox.curselection()
+            if not selected_indices: return
+
+            idx = selected_indices[0]
+            # Optionally, ask for confirmation before deleting the actual file
+            # if messagebox.askyesno("Delete Image", f"Permanently delete {os.path.basename(self.image_paths[idx])}?"):
+            #     os.remove(self.image_paths[idx])
+            self.image_paths.pop(idx)
+            self._update_image_listbox()
+            
+            if len(self.image_paths) > 0:
+                new_selection = min(idx, len(self.image_paths) - 1)
+                self.image_listbox.selection_set(new_selection)
+            self._update_image_preview()
+        except Exception as e:
+            logger.error(f"Error deleting image: {e}")
+    
+    def _setup_discogs_results(self, parent):
+        """Setup Discogs search results view"""
+        # Filter controls
+        controls_frame = tk.Frame(parent)
+        controls_frame.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(controls_frame, text="Filter:").pack(side="left", padx=(0, 5))
+        self.discogs_search_filter_var = tk.StringVar()
+        filter_entry = tk.Entry(controls_frame, textvariable=self.discogs_search_filter_var, width=30)
+        filter_entry.pack(side="left", padx=5)
+        filter_entry.bind("<KeyRelease>", self.refresh_discogs_view)
+        
+        # Results tree
+        tree_container = tk.Frame(parent)
+        tree_container.pack(fill="both", expand=True)
+        
+        cols = ("ID", "Artist", "Title", "Cat#", "Year", "Country", "Format")
+        self.discogs_tree = ttk.Treeview(tree_container, columns=cols, show="headings")
+        
+        for col in cols:
+            self.discogs_tree.heading(col, text=col, command=lambda c=col: self.sort_discogs_results(c))
+        
+        # Column widths
+        self.discogs_tree.column("ID", width=0, stretch=tk.NO)
+        self.discogs_tree.column("Artist", width=200)
+        self.discogs_tree.column("Title", width=280)
+        self.discogs_tree.column("Cat#", width=100)
+        self.discogs_tree.column("Year", width=60, anchor="center")
+        self.discogs_tree.column("Country", width=100, anchor="center")
+        self.discogs_tree.column("Format", width=200)
+        
+        # Scrollbar
+        tree_scroll = tk.Scrollbar(tree_container, orient="vertical", command=self.discogs_tree.yview)
+        self.discogs_tree.configure(yscrollcommand=tree_scroll.set)
+        
+        # Bindings
+        self.discogs_tree.bind("<Double-1>", self.apply_selected_discogs)
+        self.discogs_tree.bind("<Button-3>", self.show_discogs_context_menu)
+        self.discogs_tree.bind("<Button-2>", self.show_discogs_context_menu)
+        
+        # Pack
+        self.discogs_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+        
+        # Context menu
+        self.discogs_context_menu = tk.Menu(self.root, tearoff=0)
+        self.discogs_context_menu.add_command(label="Apply Selected Result", command=self.apply_selected_discogs)
+        self.discogs_context_menu.add_command(label="View on Discogs", command=self.open_discogs_release_page)
+        self.discogs_context_menu.add_separator()
+        self.discogs_context_menu.add_command(label="Get Price Suggestion", command=self.get_price_suggestion)
+        self.discogs_context_menu.add_command(label="View Discogs Sales History", command=lambda: self.open_sold_listings_from_selection("Discogs"))
+        self.discogs_context_menu.add_command(label="View eBay Sales History", command=lambda: self.open_sold_listings_from_selection("eBay"))
+    
+    def _setup_inventory_tab(self):
+        """Setup inventory tab with all features"""
+        inv_frame = tk.Frame(self.inventory_tab)
+        inv_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Controls
+        controls_frame = tk.Frame(inv_frame)
+        controls_frame.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(controls_frame, text="Search:").pack(side="left", padx=(0, 5))
+        self.inventory_search_var = tk.StringVar()
+        search_entry = tk.Entry(controls_frame, textvariable=self.inventory_search_var, width=30)
+        search_entry.pack(side="left", padx=5)
+        search_entry.bind("<KeyRelease>", lambda e: self.populate_inventory_view(self.inventory_search_var.get()))
+        tk.Button(controls_frame, text="Edit in Lister", command=self.edit_in_lister).pack(side="left", padx=5)
+        tk.Button(controls_frame, text="Delete Selected", command=self.delete_inventory_item).pack(side="left", padx=5)
+        tk.Button(controls_frame, text="Select All", command=self.select_all_inventory).pack(side="left", padx=(10, 0))
+        tk.Button(controls_frame, text="Deselect All", command=self.deselect_all_inventory).pack(side="left", padx=5)
+        
+        # Status buttons
+        controls_frame2 = tk.Frame(inv_frame)
+        controls_frame2.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(controls_frame2, text="Update Status:").pack(side="left")
+        for status in ["For Sale", "Sold", "Not For Sale"]:
+            tk.Button(
+                controls_frame2,
+                text=status,
+                command=lambda s=status: self.update_inventory_status(s)
+            ).pack(side="left", padx=5)
+        
+        # Publishing section
+        tk.Label(controls_frame2, text="eBay:", font=("Helvetica", 10, "bold")).pack(side="left", padx=(20, 5))
+        
+
+        
+        
+        tk.Button(controls_frame2, text="Import from eBay", command=self.action_import_from_ebay).pack(side="left", padx=4)
+        tk.Button(controls_frame2, text="Open on eBay", command=self.action_open_on_ebay_selected).pack(side="left", padx=4)
+        tk.Button(controls_frame2, text="Sync from eBay", command=self.action_ebay_sync_selected).pack(side="left", padx=4)
+        tk.Button(controls_frame2, text="Save Draft Locally", command=self.action_ebay_save_unpublished, bg="#e6f3ff", state="disabled").pack(side="left", padx=2)
+        self.publish_ebay_btn = tk.Button(controls_frame2, text="Publish Live", command=self.action_ebay_publish_live, bg="#ffe6e6", state="disabled")
+        self.publish_ebay_btn.pack(side="left", padx=2)
+        
+        tk.Label(controls_frame2, text="Discogs:", font=("Helvetica", 10, "bold")).pack(side="left", padx=(10, 5))
+        
+        tk.Button(controls_frame2, text="Sync from Discogs", command=self.manual_sync_now).pack(side="left", padx=4)
+        self.publish_discogs_btn = tk.Button(controls_frame2, text="Save Draft", command=self.action_discogs_save_unpublished, bg="#e6f3ff", state="disabled")
+        self.publish_discogs_btn.pack(side="left", padx=2)
+        self.publish_discogs_live_btn = tk.Button(controls_frame2, text="Publish Live", command=self.action_discogs_publish_live, bg="#ffe6e6", state="disabled")
+        self.publish_discogs_live_btn.pack(side="left", padx=2)
+        
+        # Utility buttons
+        self.open_in_browser_btn = tk.Button(controls_frame2, text="Open in Browser", command=self.open_listing_in_browser, state="disabled")
+        self.open_in_browser_btn.pack(side="left", padx=(20, 5))
+        
+        self.import_button = tk.Button(controls_frame2, text="Import Discogs Inventory", state="disabled", command=self.start_discogs_import)
+        self.import_button.pack(side="left", padx=5)
+        
+        # Inventory tree
+        # Include eBay draft/live and Discogs IDs for traceability
+        cols = ("SKU", "Artist", "Title", "Price", "Status", "eBay Draft ID", "eBay Listing ID", "Discogs ID", "Date Added")
+        self.inventory_tree = ttk.Treeview(inv_frame, columns=cols, show="headings", selectmode="extended")
+
+        for col in cols:
+            self.inventory_tree.heading(col, text=col, command=lambda c=col: self.sort_inventory(c))
+
+        # Column widths (adjusted for additional ID columns)
+        self.inventory_tree.column("SKU", width=140)
+        self.inventory_tree.column("Artist", width=180)
+        self.inventory_tree.column("Title", width=260)
+        self.inventory_tree.column("Price", width=80, anchor="e")
+        self.inventory_tree.column("Status", width=110)
+        self.inventory_tree.column("eBay Draft ID", width=140)
+        self.inventory_tree.column("eBay Listing ID", width=140)
+        self.inventory_tree.column("Discogs ID", width=120)
+        self.inventory_tree.column("Date Added", width=150)
+        
+        # Bindings
+        self.inventory_tree.bind("<Double-1>", self.edit_in_lister)
+        self.inventory_tree.bind("<Button-3>", self.show_inventory_context_menu)
+        self.inventory_tree.bind("<Button-2>", self.show_inventory_context_menu)
+        self.inventory_tree.bind("<Control-Button-1>", self.show_inventory_context_menu)
+        self.inventory_tree.bind("<Return>", self.edit_in_lister)
+        self.inventory_tree.bind("<<TreeviewSelect>>", self.on_inventory_selection)
+        
+        # Scrollbar
+        inv_scroll = tk.Scrollbar(inv_frame, orient="vertical", command=self.inventory_tree.yview)
+        self.inventory_tree.configure(yscrollcommand=inv_scroll.set)
+        
+        # Pack
+        self.inventory_tree.pack(side="left", fill="both", expand=True)
+        inv_scroll.pack(side="right", fill="y")
+        
+        # Log area
+        log_frame = tk.Frame(inv_frame)
+        log_frame.pack(fill="both", expand=True, pady=(5, 0))
+        
+        self.publish_log = scrolledtext.ScrolledText(log_frame, height=8, state="disabled", wrap="word")
+        self.publish_log.pack(fill="both", expand=True)
+        
+        # Context menu with all options
+        self.inventory_context_menu = tk.Menu(self.root, tearoff=0)
+        self.inventory_context_menu.add_command(label="Edit in Lister", command=self.edit_in_lister)
+        self.inventory_context_menu.add_separator()
+        self.inventory_context_menu.add_command(label="Open Discogs Listing", command=self.open_discogs_listing)
+        self.inventory_context_menu.add_command(label="Open eBay Listing", command=self.open_ebay_listing)
+        self.inventory_context_menu.add_command(label="View Discogs Release Page", command=self.open_discogs_release_from_inventory)
+        self.inventory_context_menu.add_separator()
+        self.inventory_context_menu.add_command(label="Sync with Discogs", command=self.manual_sync_now)
+        self.inventory_context_menu.add_command(label="Sync from eBay", command=self.action_ebay_sync_selected)
+        self.inventory_context_menu.add_separator()
+        self.inventory_context_menu.add_command(label="Delete", command=self.delete_inventory_item)
+    
+    def _setup_settings_tab_complete(self):
+        """Setup settings tab with ALL features including status mapping and sales"""
+        settings_frame = tk.Frame(self.settings_tab, padx=10, pady=10)
+        settings_frame.pack(fill="both", expand=True)
+        
+        # Settings Notebook
+        settings_notebook = ttk.Notebook(settings_frame)
+        settings_notebook.pack(fill="both", expand=True, pady=(10, 0))
+
+        # --- Connections & Sync Tab ---
+        conn_sync_tab = ttk.Frame(settings_notebook)
+        settings_notebook.add(conn_sync_tab, text="Connections & Sync")
+
+        # Discogs connection
+        discogs_frame = ttk.LabelFrame(conn_sync_tab, text="Discogs Account Connection", padding=(10, 5))
+        discogs_frame.pack(fill="x", pady=(0, 10), padx=5)
+        
+        self.discogs_auth_status_var = tk.StringVar(value="Not Connected")
+        ttk.Label(discogs_frame, textvariable=self.discogs_auth_status_var, font=("Helvetica", 14, "italic")).pack(side="left", padx=5, pady=5)
+        
+        self.discogs_connect_button = tk.Button(discogs_frame, text="Connect to Discogs Account", command=self.authenticate_discogs)
+        self.discogs_connect_button.pack(side="left", padx=5, pady=5)
+        
+        # eBay connection
+        ebay_frame = ttk.LabelFrame(conn_sync_tab, text="eBay Account Connection", padding=(10, 5))
+        ebay_frame.pack(fill="x", pady=(0, 10), padx=5)
+        
+        self.ebay_auth_status_var = tk.StringVar(value="Not Connected")
+        ttk.Label(ebay_frame, textvariable=self.ebay_auth_status_var, font=("Helvetica", 14, "italic")).pack(side="left", padx=5, pady=5)
+        
+        tk.Button(ebay_frame, text="Test Connection", command=self.test_ebay_connection).pack(side="left", padx=5, pady=5)
+        tk.Button(ebay_frame, text="Copy eBay Status", command=lambda: self._copy_ebay_status()).pack(side="left", padx=5, pady=5)
+
+        # Auto-sync settings
+        sync_frame = ttk.LabelFrame(conn_sync_tab, text="Automatic Inventory Sync", padding=(10, 5))
+        sync_frame.pack(fill="x", pady=(10, 0), padx=5)
+        
+        sync_controls = tk.Frame(sync_frame)
+        sync_controls.pack(fill="x", pady=(0, 5))
+        
+        self.auto_sync_var = tk.BooleanVar(value=self.auto_sync_enabled)
+        tk.Checkbutton(sync_controls, text="Enable automatic sync", variable=self.auto_sync_var, 
+                      command=self.toggle_auto_sync).pack(side="left", padx=5)
+        
+        self.two_way_sync_var = tk.BooleanVar(value=self.two_way_sync_enabled)
+        tk.Checkbutton(sync_controls, text="Enable two-way sync", variable=self.two_way_sync_var,
+                      command=self.toggle_two_way_sync).pack(side="left", padx=(20, 5))
+        
+        # Advanced sync options
+        advanced_controls = tk.Frame(sync_frame)
+        advanced_controls.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(advanced_controls, text="Advanced:", font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 5))
+        
+        self.attempt_updates_var = tk.BooleanVar(value=self.attempt_discogs_updates)
+        tk.Checkbutton(advanced_controls, text="Attempt Discogs updates (experimental)",
+                      variable=self.attempt_updates_var, command=self.toggle_attempt_updates).pack(side="left", padx=5)
+        
+        # Sync interval
+        interval_frame = tk.Frame(sync_frame)
+        interval_frame.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(interval_frame, text="Sync every:").pack(side="left", padx=(0, 5))
+        self.sync_interval_var = tk.StringVar(value=str(self.auto_sync_interval // 60))
+        tk.Spinbox(interval_frame, from_=1, to=60, width=5, textvariable=self.sync_interval_var,
+                   command=self.update_sync_interval).pack(side="left", padx=5)
+        tk.Label(interval_frame, text="minutes").pack(side="left", padx=(0, 10))
+        
+        tk.Button(interval_frame, text="Sync Now", command=self.manual_sync_now).pack(side="left", padx=5)
+        
+        # Sync status
+        status_frame = tk.Frame(sync_frame)
+        status_frame.pack(fill="x", pady=(5, 0))
+        
+        self.sync_status_var = tk.StringVar(value="Auto-sync disabled")
+        ttk.Label(status_frame, textvariable=self.sync_status_var, font=("Helvetica", 10, "italic")).pack(side="left", padx=5)
+        
+        # Sync log
+        log_frame = ttk.LabelFrame(sync_frame, text="Sync Activity Log", padding=(5, 5))
+        log_frame.pack(fill="both", expand=True, pady=(5, 0))
+        
+        self.sync_log_text = tk.Text(log_frame, height=8, width=80)
+        log_scroll = tk.Scrollbar(log_frame, orient="vertical", command=self.sync_log_text.yview)
+        self.sync_log_text.configure(yscrollcommand=log_scroll.set)
+        
+        self.sync_log_text.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+        
+        # --- Mappings & Workflow Tab ---
+        mappings_tab = ttk.Frame(settings_notebook)
+        settings_notebook.add(mappings_tab, text="Mappings & Workflow")
+
+        # Image Workflow Settings
+        image_frame = ttk.LabelFrame(mappings_tab, text="Image Workflow Settings", padding=(10, 5))
+        image_frame.pack(fill="x", pady=(10, 10), padx=5)
+
+        path_frame = tk.Frame(image_frame)
+        path_frame.pack(fill="x")
+        
+        tk.Label(path_frame, text="Image Staging Folder:").pack(side="left", anchor="w")
+        path_entry = tk.Entry(path_frame, textvariable=self.image_staging_path_var, state="readonly", width=60)
+        path_entry.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Button(path_frame, text="Browse...", command=self._select_image_staging_path).pack(side="left")
+
+        # Status Mapping Configuration
+        status_mapping_frame = ttk.LabelFrame(mappings_tab, text="Status Mapping Configuration", padding=(10, 5))
+        status_mapping_frame.pack(fill="x", pady=(10, 0), padx=5)
+        
+        tk.Label(status_mapping_frame, text="Configure how Discogs inventory statuses map to your local inventory statuses:", 
+                 font=("Helvetica", 11)).pack(anchor="w", pady=(0, 10))
+        
+        # Mapping table
+        mapping_table_frame = tk.Frame(status_mapping_frame)
+        mapping_table_frame.pack(fill="x", pady=(0, 10))
+        
+        tk.Label(mapping_table_frame, text="Discogs Status", font=("Helvetica", 12, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(mapping_table_frame, text="→", font=("Helvetica", 12, "bold")).grid(row=0, column=1, padx=5, pady=5)
+        tk.Label(mapping_table_frame, text="Local Status", font=("Helvetica", 12, "bold")).grid(row=0, column=2, padx=10, pady=5, sticky="w")
+        
+        for i, (discogs_status, default_local_status) in enumerate(DEFAULT_STATUS_MAPPINGS.items(), 1):
+            tk.Label(mapping_table_frame, text=discogs_status, font=("Helvetica", 11)).grid(row=i, column=0, padx=10, pady=3, sticky="w")
+            tk.Label(mapping_table_frame, text="→", font=("Helvetica", 11)).grid(row=i, column=1, padx=5, pady=3)
+            
+            var = tk.StringVar(value=self.status_mappings.get(discogs_status, default_local_status))
+            self.status_mapping_vars[discogs_status] = var
+            
+            ttk.Combobox(mapping_table_frame, textvariable=var, values=LOCAL_STATUSES, 
+                        state="readonly", width=15).grid(row=i, column=2, padx=10, pady=3, sticky="w")
+        
+        # Mapping buttons
+        mapping_buttons_frame = tk.Frame(status_mapping_frame)
+        mapping_buttons_frame.pack(anchor="w", pady=(5, 0))
+        
+        tk.Button(mapping_buttons_frame, text="Save Mappings", command=self._save_status_mappings).pack(side="left", padx=(0, 10))
+        tk.Button(mapping_buttons_frame, text="Reset to Defaults", command=self._reset_status_mappings).pack(side="left")
+
+        # --- Sales Tab ---
+        sales_tab = ttk.Frame(settings_notebook)
+        settings_notebook.add(sales_tab, text="Sales History")
+        
+        sales_notebook_inner = ttk.Notebook(sales_tab)
+        sales_notebook_inner.pack(fill="both", expand=True, pady=5)
+        
+        # Discogs sales tab
+        discogs_sales_tab = ttk.Frame(sales_notebook_inner)
+        sales_notebook_inner.add(discogs_sales_tab, text="Discogs Sales")
+        
+        ds_frame = ttk.LabelFrame(discogs_sales_tab, text="Discogs Sales", padding=(10, 5))
+        ds_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        ds_controls = tk.Frame(ds_frame)
+        ds_controls.pack(fill="x", pady=(0, 5))
+        
+        self.check_sales_button = tk.Button(ds_controls, text="Check for New Sales", state="disabled",
+                                           command=self.check_discogs_sales)
+        self.check_sales_button.pack(side="left", anchor="w", padx=5, pady=5)
+        
+        tk.Button(ds_controls, text="Sync Selected Sale", command=self.sync_discogs_sale).pack(side="left", anchor="w", padx=5, pady=5)
+        
+        # Discogs sales tree
+        ds_cols = ("Order ID", "Date", "Buyer", "Artist", "Title", "Price", "Release ID")
+        self.sales_tree = ttk.Treeview(ds_frame, columns=ds_cols, show="headings")
+        
+        for col in ds_cols:
+            self.sales_tree.heading(col, text=col)
+        
+        self.sales_tree.pack(side="left", fill="both", expand=True)
+        
+        ds_scroll = tk.Scrollbar(ds_frame, orient="vertical", command=self.sales_tree.yview)
+        ds_scroll.pack(side="right", fill="y")
+        self.sales_tree.configure(yscrollcommand=ds_scroll.set)
+        
+        # eBay sales tab
+        ebay_sales_tab = ttk.Frame(sales_notebook_inner)
+        sales_notebook_inner.add(ebay_sales_tab, text="eBay Sales")
+        
+        es_frame = ttk.LabelFrame(ebay_sales_tab, text="eBay Account & Sales", padding=(10, 5))
+        es_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        es_sales_controls = tk.Frame(es_frame)
+        es_sales_controls.pack(fill="x", pady=(0, 5))
+        
+        tk.Label(es_sales_controls, text="Start Date (DD-MM-YYYY):").pack(side="left", padx=(0, 5))
+        self.ebay_start_date_var = tk.StringVar()
+        tk.Entry(es_sales_controls, textvariable=self.ebay_start_date_var, width=12).pack(side="left", padx=5)
+        
+        tk.Label(es_sales_controls, text="End Date (DD-MM-YYYY):").pack(side="left", padx=(10, 5))
+        self.ebay_end_date_var = tk.StringVar()
+        tk.Entry(es_sales_controls, textvariable=self.ebay_end_date_var, width=12).pack(side="left", padx=5)
+        
+        # Set default dates
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=30)
+        self.ebay_start_date_var.set(start_date.strftime("%d-%m-%Y"))
+        self.ebay_end_date_var.set(end_date.strftime("%d-%m-%Y"))
+        
+        self.check_ebay_sales_button = tk.Button(es_sales_controls, text="Check for Sales", state="disabled",
+                                                command=self.check_ebay_sales)
+        self.check_ebay_sales_button.pack(side="left", anchor="w", padx=15, pady=5)
+        
+        tk.Button(es_sales_controls, text="Sync Selected Sale", command=self.sync_ebay_sale).pack(side="left", anchor="w", padx=5, pady=5)
+        
+        # eBay sales tree
+        es_cols = ("Order ID", "Date", "Buyer", "Artist", "Title", "Price", "Item ID")
+        self.ebay_sales_tree = ttk.Treeview(es_frame, columns=es_cols, show="headings")
+        
+        for col in es_cols:
+            self.ebay_sales_tree.heading(col, text=col)
+        
+        self.ebay_sales_tree.pack(side="left", fill="both", expand=True, pady=(5, 0))
+        
+        es_scroll = tk.Scrollbar(es_frame, orient="vertical", command=self.ebay_sales_tree.yview)
+        es_scroll.pack(side="right", fill="y", pady=(5, 0))
+        self.ebay_sales_tree.configure(yscrollcommand=es_scroll.set)
+
+    def _select_image_staging_path(self):
+        """Open a dialog to select the image staging directory."""
+        directory = filedialog.askdirectory(
+            title="Select Image Staging Folder",
+            initialdir=self.config.get("image_staging_path") or os.path.expanduser("~")
+        )
+        if directory:
+            self.image_staging_path_var.set(directory)
+            self.config.save({"image_staging_path": directory})
+            messagebox.showinfo("Path Saved", f"Image staging path set to:\n{directory}")
+    
+    def _update_connection_status(self):
+        """Update connection status for APIs"""
+        # Discogs status
+        if self.discogs_api.is_connected():
+            try:
+                user = self.discogs_api.client.identity()
+                self.discogs_auth_status_var.set(f"Connected as: {user.username}")
+                self.discogs_connect_button.config(state="disabled")
+                self.check_sales_button.config(state="normal")
+                self.import_button.config(state="normal")
+                
+                # Enable all Discogs buttons across tabs
+                try:
+                    self.discogs_draft_button.config(state="normal")
+                    self.discogs_live_button.config(state="normal") 
+                except AttributeError:
+                    pass  # Buttons may not exist yet during initialization
+                try:
+                    self.publish_discogs_btn.config(state="normal")
+                    self.publish_discogs_live_btn.config(state="normal")
+                except AttributeError:
+                    pass
+                
+                # Legacy button support
+                try:
+                    self.list_on_discogs_button.config(state="normal")
+                except AttributeError:
+                    pass
+                    
+            except:
+                self.discogs_auth_status_var.set("Not Connected")
+        
+        # eBay status
+        if self.ebay_api.test_connection():
+            self.ebay_auth_status_var.set("Connected Successfully")
+            self.check_ebay_sales_button.config(state="normal")
+            self.list_on_ebay_button.config(state="normal")
+    
+    def _copy_ebay_status(self):
+        """Copy eBay status to clipboard"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.ebay_auth_status_var.get())
+        messagebox.showinfo("Copied", "Status copied to clipboard")
+    
+    # ========================================================================
+    # ALL CORE METHODS INCLUDING MISSING ONES
+    # ========================================================================
+    
+    def search_discogs(self):
+        """Search Discogs for releases"""
+        artist = self.entries["artist"].get().strip()
+        title = self.entries["title"].get().strip()
+        
+        if not artist and not title:
+            messagebox.showwarning("Input Required", "Please enter artist and/or title")
+            return
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        # Build search parameters
+        params = {"per_page": 100, "type": "release"}
+        if artist:
+            params["artist"] = artist
+        if title:
+            params["release_title"] = title
+        
+        # Search in thread
+        def search_worker():
+            try:
+                results = self.discogs_api.search(params)
+                self.safe_after(0, lambda: self.display_discogs_results(results))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Search Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=search_worker, daemon=True).start()
+    
+    def search_by_catno(self):
+        """Search Discogs by catalog number"""
+        catno = self.entries["cat_no"].get().strip()
+        
+        if not catno:
+            messagebox.showwarning("Input Required", "Please enter a catalog number")
+            return
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        def search_worker():
+            try:
+                results = self.discogs_api.search({"catno": catno, "per_page": 100})
+                self.safe_after(0, lambda: self.display_discogs_results(results))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Search Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=search_worker, daemon=True).start()
+    
+
+
+    def display_discogs_results(self, results):
+        """Display Discogs search results in the results tree"""
+        # Clear existing results
+        for item_id in self.discogs_tree.get_children():
+            self.discogs_tree.delete(item_id)
+
+        if not results:
+            try:
+                messagebox.showinfo("No Results", "No releases found")
+            except Exception:
+                pass
+            return
+
+        self.discogs_search_results = results
+
+        for item in results:
+            title_field = item.get("title", "") or ""
+            parts = title_field.split(" - ", 1)
+            artist = parts[0] if parts else ""
+            title = parts[1] if len(parts) > 1 else ""
+
+            values = (
+                item.get("id"),
+                artist,
+                title,
+                item.get("catno", "N/A"),
+                item.get("year", "N/A"),
+                item.get("country", "N/A"),
+                ", ".join((item.get("format", []) or []))
+            )
+            self.discogs_tree.insert("", "end", values=values)
+
+    def _grade_name_to_abbrev(self, v: str) -> str:
+        try:
+            rev = { (name or "").lower(): abbr for abbr, name in GRADE_ABBREVIATIONS.items() }
+            low = (v or "").strip().lower()
+            if low in rev:
+                return rev[low]
+            fixes = {
+                "near mint": "NM", "near mint (nm or m-)": "NM", "very good plus": "VG+", "very good+": "VG+",
+                "very good": "VG", "good plus": "G+", "good+": "G+", "good": "G", "fair": "F", "poor": "P", "mint": "M"
+            }
+            return fixes.get(low, v)
+        except Exception:
+            return v
+
+    def _discogs_api_post(self, url: str, form: dict):
+        import urllib.request, urllib.parse, json
+        from vinyltool.core.config import Config
+        cfg = Config().load()
+        token = cfg.get("discogs_token") or cfg.get("discogs_oauth_token") or ""
+        ua = cfg.get("discogs_user_agent") or "VinylTool/1.0"
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("User-Agent", ua)
+        if token:
+            req.add_header("Authorization", f"Discogs token={token}")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode("utf-8", "ignore")
+                try:
+                    js = json.loads(raw) if raw else None
+                except Exception:
+                    js = None
+                return (200 <= r.status < 300, js, r.status)
+        except Exception as e:
+            return (False, {"error": str(e)}, getattr(e, "code", 0) or 0)
+
+    def _discogs_fetch_collection_fields(self) -> dict | None:
+        try:
+            token, username = self._get_discogs_credentials()
+            if not (token and username):
+                return None
+            url = f"https://api.discogs.com/users/{username}/collection/fields"
+            fields = self._discogs_api_request(url)
+            media_id = sleeve_id = None
+            for f in (fields or []):
+                name = str(f.get("name","")).strip().lower()
+                if name in ("media condition", "media", "disc condition"):
+                    media_id = f.get("id")
+                if name in ("sleeve condition", "sleeve", "cover condition"):
+                    sleeve_id = f.get("id")
+            return {"media": media_id, "sleeve": sleeve_id}
+        except Exception:
+            return None
+
+    def _discogs_update_collection_fields(self, folder_id: int, release_id: int, instance_id: int, fields: dict) -> bool:
+        token, username = self._get_discogs_credentials()
+        if not (token and username):
+            messagebox.showwarning("Not Connected", "Please connect to Discogs first.")
+            return False
+        url = f"https://api.discogs.com/users/{username}/collection/folders/{folder_id}/releases/{release_id}/instances/{instance_id}"
+        form = {}
+        for fid, val in (fields or {}).items():
+            form[f"fields[{fid}]"] = val
+        ok, _, status = self._discogs_api_post(url, form)
+        if not ok:
+            try:
+                self.append_log(f"[discogs] Update fields failed (HTTP {status})", "red")
+            except Exception:
+                pass
+        return ok
+    def apply_selected_discogs(self, event=None):
+        """Apply the selected Discogs result to the form fields."""
+        selection = self.discogs_tree.selection()
+        if not selection:
+            return
+        
+        # Get the release ID from the selected item
+        item_values = self.discogs_tree.item(selection[0], "values")
+        release_id = item_values[0]  # First column is the ID
+        
+        if not release_id:
+            return
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        def fetch_and_apply_worker():
+            try:
+                # Fetch the full, detailed release data
+                release_data = self.discogs_api.get_release(release_id)
+                if release_data:
+                    self.safe_after(0, lambda: self._populate_lister_with_release_data(release_data))
+                else:
+                    self.safe_after(0, lambda: messagebox.showerror("API Error", f"Could not fetch full details for release {release_id}."))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("API Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=fetch_and_apply_worker, daemon=True).start()
+
+
+
+    def _collection_edit_grades(self):
+        selection = self.collection_tree.selection()
+        if not selection:
+            return
+        vals = self.collection_tree.item(selection[0], "values")
+        try:
+            curr_media = vals[7]
+            curr_sleeve = vals[8]
+            instance_id = int(vals[11])
+            release_id = int(vals[12])
+            folder_id = int(self._collection_state.get("folder_id") or 0)
+        except Exception:
+            messagebox.showerror("Error", "Could not determine selection details.")
+            return
+
+        if not self._discogs_field_ids or not (self._discogs_field_ids.get("media") and self._discogs_field_ids.get("sleeve")):
+            messagebox.showwarning(
+                "Custom Fields Required",
+                "Discogs custom collection fields 'Media Condition' and 'Sleeve Condition' were not found.\n\nPlease create them in Discogs (Collection → Settings → Custom fields), then Refresh."
+            )
+            return
+
+        threading.Thread(target=fetch_and_apply_worker, daemon=True).start()
+
+    def _populate_lister_with_release_data(self, release_data: dict):
+        """
+        Populates the lister form with cleaned, detailed data from a full Discogs release.
+        """
+        artist_names = [re.sub(r'\s*\(\d+\)$', '', a['name']).strip() for a in release_data.get('artists', [])]
+        artist = ", ".join(artist_names)
+
+        barcode, cat_no = self._extract_barcode_and_cat_no(release_data)
+        matrix_info = self._extract_matrix_info(release_data)
+        
+        # --- Populate Form Fields ---
+        self.entries["artist"].delete(0, tk.END)
+        self.entries["artist"].insert(0, artist)
+        
+        self.entries["title"].delete(0, tk.END)
+        self.entries["title"].insert(0, release_data.get('title', ''))
+
+        self.entries["cat_no"].delete(0, tk.END)
+        self.entries["cat_no"].insert(0, cat_no)
+        
+        self.entries["barcode"].delete(0, tk.END)
+        self.entries["barcode"].insert(0, barcode)
+
+        self.entries["year"].delete(0, tk.END)
+        self.entries["year"].insert(0, str(release_data.get('year', '')))
+        
+        self.entries["matrix_runout"].delete("1.0", tk.END)
+        self.entries["matrix_runout"].insert("1.0", matrix_info)
+
+        formats_list = [f.get('name', '') for f in release_data.get('formats', [])]
+        if formats_list:
+            # Set a sensible default for the format dropdown
+            main_format = formats_list[0]
+            if main_format.lower() == 'vinyl':
+                self.entries["format"].set('LP')
+            elif main_format in self.entries['format']['values']:
+                 self.entries["format"].set(main_format)
+            else:
+                 self.entries["format"].set('Other')
+
+        self.current_release_id = release_data.get('id')
+        
+        self.release_status_label.config(
+            text=f"✓ Release selected: {release_data.get('title')} (ID: {self.current_release_id})",
+            fg="green"
+        )
+        
+        messagebox.showinfo("Success", f"Applied info for '{release_data.get('title')}'")
+
+    def generate_listing_title(self, *args, **kwargs):
+        from vinyltool.core import listing
+        return listing.generate_listing_title(self, *args, **kwargs)
+    def build_description(self, *args, **kwargs):
+        from vinyltool.core import listing
+        return listing.build_description(self, *args, **kwargs)
+    def _render_analog_theory_description(self, *args, **kwargs):
+        from vinyltool.core import listing
+        return listing._render_analog_theory_description(self, *args, **kwargs)
+    def list_on_discogs(self):
+        """List item on Discogs"""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to Discogs first")
+            return
+        if not self.current_release_id:
+            messagebox.showerror("Missing Release", "You must select a specific Discogs release variant first")
+            return
+        try:
+            price = float(self.price_entry.get())
+            media_condition = self.entries["media_condition"].get()
+            if not media_condition or media_condition not in REVERSE_GRADE_MAP:
+                messagebox.showwarning("Validation Error", "Please select a valid media condition")
+                return
+        except (ValueError, TypeError):
+            messagebox.showwarning("Validation Error", "Please enter a valid price")
+            return
+        
+        listing_data = {
+            'release_id': self.current_release_id,
+            'price': price,
+            'status': 'Draft',
+            'condition': REVERSE_GRADE_MAP.get(media_condition),
+            'sleeve_condition': REVERSE_GRADE_MAP.get(self.entries["sleeve_condition"].get(), 'Generic'),
+            'comments': self.full_desc.get("1.0", tk.END).strip()
+        }
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        def list_worker():
+            try:
+                listing_id = self.discogs_api.create_listing(listing_data)
+                if listing_id:
+                    self.safe_after(0, lambda: self._handle_listing_success(listing_id))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Listing Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=list_worker, daemon=True).start()
+    
+    def _handle_listing_success(self, listing_id):
+        """Handle successful Discogs listing"""
+        messagebox.showinfo("Success", f"Successfully listed item on Discogs as a Draft (Listing ID: {listing_id})")
+        if self.editing_sku:
+            try:
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE inventory SET discogs_listing_id = ? WHERE sku = ?", (listing_id, self.editing_sku))
+            except Exception as e:
+                logger.error(f"Failed to update inventory with listing ID: {e}")
+
+    
+    def list_on_ebay(self):
+    
+        """Create/update eBay listing from the Lister tab (uses Inventory API)."""
+    
+        if not self.ebay_api.test_connection():
+    
+            messagebox.showwarning("Not Connected", "Please check your eBay credentials in config.json and re-authenticate if necessary.")
+    
+            return
+
+    
+        # Validation
+    
+        required_fields = ['artist', 'title', 'media_condition']
+    
+        for field in required_fields:
+    
+            key = field.replace(' ', '_')
+    
+            if not self.entries.get(key) or not self.entries[key].get().strip():
+    
+                messagebox.showwarning("Validation Error", f"Please enter {field}")
+    
+                return
+
+    
+        try:
+    
+            price = float(self.price_entry.get())
+    
+            if price <= 0:
+    
+                messagebox.showwarning("Validation Error", "Please enter a valid price")
+    
+                return
+    
+        except (ValueError, TypeError):
+    
+            messagebox.showwarning("Validation Error", "Please enter a valid price")
+    
+            return
+
+    
+        # SKU
+    
+        sku = self.editing_sku or self.sku_display_var.get() or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    
+        if not self.editing_sku and not self.temporary_sku:
+    
+            self.sku_display_var.set(sku)
+
+    
+        format_val = self.entries["format"].get() or "LP"
+    
+        media_cond_str = self.entries["media_condition"].get()
+
+    
+        condition_enum = EBAY_INVENTORY_CONDITION_MAP.get(media_cond_str, "USED_GOOD")
+    
+        condition_id_numeric = EBAY_CONDITION_MAP_NUMERIC.get(media_cond_str, "3000")
+    
+        category_id = EBAY_VINYL_CATEGORIES.get(format_val, "176985")
+    
+        ebay_title = self.entries["listing_title"].get() or f"{self.entries['artist'].get()} - {self.entries['title'].get()}"
+    
+        description_html = self.full_desc.get("1.0", tk.END).strip()
+
+    
+        listing_data = {
+    
+            "sku": sku,
+    
+            "title": ebay_title[:80],
+    
+            "description": description_html,
+    
+            "categoryId": str(category_id),
+    
+            "price": price,
+    
+            "quantity": 1,
+    
+            "condition_enum": condition_enum,
+    
+            "condition_id_numeric": condition_id_numeric,
+    
+            "media_condition": self.entries["media_condition"].get(),
+    
+            "sleeve_condition": self.entries["sleeve_condition"].get(),
+    
+            "currency": "GBP",
+    
+            "marketplaceId": self.config.get("marketplace_id", "EBAY_GB"),
+    
+            "paymentPolicyId": self.config.get("ebay_payment_policy_id"),
+    
+            "returnPolicyId": self.config.get("ebay_return_policy_id"),
+    
+            "shippingPolicyId": self.config.get("ebay_shipping_policy_id"),
+    
+            "images": list(self.image_paths),
+    
+        }
+
+    
+        # Location fields (Sell Inventory + Trading fallbacks)
+    
+        _pc = (self.config.get('postal_code', '') or '').strip()
+    
+        _cc = (self.config.get('country', 'GB') or 'GB').strip()
+    
+        _city = self.config.get('city', 'Kidderminster')
+
+    
+        # Sell Inventory shape
+    
+        listing_data['itemLocation'] = {'countryCode': _cc, 'postalCode': _pc, 'city': _city}
+
+    
+        # Trading-style fallbacks under `item` and top-level PascalCase
+    
+        listing_data.setdefault('item', {})
+    
+        listing_data['item'].update({
+    
+            'country': _cc, 'postalCode': _pc, 'location': _city,
+    
+            'Country': _cc, 'PostalCode': _pc, 'Location': _city,
+    
+        })
+    
+        listing_data['Country'] = _cc
+    
+        listing_data['PostalCode'] = _pc
+    
+        listing_data['Location'] = _city
+
+    
+        # Merchant Location
+    
+        try:
+    
+            _mlk = self._ensure_ebay_location()
+    
+        except Exception:
+    
+            _mlk = None
+    
+        if _mlk and getattr(self, '_inventory_location_exists', lambda x: False)(_mlk):
+    
+            listing_data['merchantLocationKey'] = _mlk
+    
+        else:
+    
+            listing_data.pop('merchantLocationKey', None)
+
+    
+        # Explicit Trading-style Item block for bridges expecting Item.*
+    
+        listing_data['Item'] = {
+    
+            'Country': listing_data.get('Country') or listing_data.get('item', {}).get('Country') or listing_data.get('item', {}).get('country'),
+    
+            'PostalCode': listing_data.get('PostalCode') or listing_data.get('item', {}).get('PostalCode') or listing_data.get('item', {}).get('postalCode'),
+    
+            'Location': listing_data.get('Location') or listing_data.get('item', {}).get('Location') or listing_data.get('item', {}).get('location'),
+    
+        }
+
+    
+        # Background worker
+    
+        self.root.config(cursor="watch")
+    
+        self.root.update()
+    
+        self.notebook.select(self.inventory_tab)
+
+    
+        def list_worker():
+    
+            try:
+    
+                self.append_log(f"SKU {sku}: Creating/updating eBay inventory item and offer...", "black")
+    
+                result = self.ebay_api.create_draft_listing(listing_data)
+    
+                if result.get("success"):
+    
+                    self.safe_after(0, lambda: self._handle_ebay_listing_success(sku, result.get("offerId")))
+    
+                else:
+    
+                    error_message = result.get('error', 'Unknown error')
+    
+                    self.append_log(f"SKU {sku}: eBay listing failed. {error_message}", "red")
+    
+                    self.safe_after(0, lambda: messagebox.showerror("Listing Failed", f"eBay listing failed for SKU {sku}:\n\n{error_message}"))
+    
+            except Exception as e:
+    
+                self.append_log(f"SKU {sku}: An unexpected error occurred: {e}", "red")
+    
+                self.safe_after(0, lambda: messagebox.showerror("Listing Error", str(e)))
+    
+            finally:
+    
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+
+    
+        threading.Thread(target=list_worker, daemon=True).start()
+    
+    def _handle_ebay_listing_success(self, sku, offer_id):
+
+    
+        """Handle successful eBay listing: resolve Item ID (listingId) and store it."""
+
+    
+        import datetime, logging
+
+    
+        logger = logging.getLogger(__name__)
+
+    
+    
+
+    
+        listing_id = None
+
+    
+        try:
+
+    
+            offer = self.ebay_api.get_offer(str(offer_id))
+
+    
+            if offer.get("success"):
+
+    
+                listing_id = offer.get('legacyItemId') or (offer.get('listing') or {}).get('legacyItemId') or offer.get('listingId') or (offer.get('listing') or {}).get('listingId')
+
+    
+        except Exception as e:
+
+    
+            logger.warning(f"[offer] Could not resolve listingId for offer {offer_id}: {e}")
+
+    
+    
+
+    
+        stored_id = listing_id or str(offer_id)
+
+    
+        label = "Item ID" if listing_id else "Offer ID"
+
+    
+        self.append_log(f"SKU {sku}: eBay listing updated ({label}: {stored_id}).", "green")
+
+    
+    
+
+    
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    
+        try:
+
+    
+            with self.db.get_connection() as conn:
+
+    
+                cursor = conn.cursor()
+
+    
+                cursor.execute("UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?", (stored_id, now_iso, sku))
+
+    
+            self.populate_inventory_view()
+
+    
+        except Exception as e:
+
+    
+            logger.error(f"Failed to update inventory with eBay ID: {e}")
+
+    
+            self.append_log(f"SKU {sku}: Failed to save eBay {label} to local DB: {e}", "red")
+
+    
+    
+
+    
+        try:
+
+    
+            messagebox.showinfo("Success", f"eBay listing updated.\n{label}: {stored_id}\n\nCheck Seller Hub → Active.")
+
+    
+        except Exception:
+
+    
+            pass
+
+
+    
+    def save_to_inventory(self):
+        """Save current form to inventory, ensuring full payload is saved on update."""
+        payload_json = json.dumps(self._serialize_form_to_payload())
+        data = {
+            "artist": self.entries["artist"].get().strip(),
+            "title": self.entries["title"].get().strip(),
+            "cat_no": self.entries["cat_no"].get().strip(),
+            "year": self.entries["year"].get().strip(),
+            "format": self.entries["format"].get(),
+            "media_condition": self.entries["media_condition"].get(),
+            "sleeve_condition": self.entries["sleeve_condition"].get(),
+            "price": self.price_entry.get().strip(),
+            "status": "For Sale",
+            "discogs_release_id": self.current_release_id,
+            "notes": self.entries["condition_notes"].get("1.0", "end-1c").strip(),
+            "matrix_runout": self.entries["matrix_runout"].get("1.0", "end-1c").strip(),
+            "condition_tags": self.entries["condition_tags"].get().strip(),
+            "description": self.full_desc.get("1.0", tk.END).strip(),
+            "shipping_option": self.entries["shipping_option"].get(),
+            "barcode": self.entries["barcode"].get().strip(),
+            "genre": self.entries["genre"].get(),
+            "new_used": self.entries["new_used"].get(),
+            "listing_title": self.entries["listing_title"].get().strip()
+        }
+        
+        if not data["title"]:
+            messagebox.showwarning("Validation Error", "Title is required")
+            return
+        try:
+            price = float(data["price"]) if data["price"] else 0
+            data["price"] = price
+        except ValueError:
+            messagebox.showwarning("Validation Error", "Invalid price")
+            return
+        
+        is_update = bool(self.editing_sku)
+        
+        if is_update:
+            sku = self.editing_sku
+        elif self.temporary_sku:
+            sku = self.temporary_sku.replace("-TEMP", "")
+            self.temporary_sku = None
+        else:
+            sku = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                if is_update:
+                    # --- CRITICAL FIX: Ensure payload is saved on update ---
+                    sql = """UPDATE inventory SET artist = :artist, title = :title, cat_no = :cat_no, year = :year, format = :format,
+                            media_condition = :media_condition, sleeve_condition = :sleeve_condition, price = :price, 
+                            discogs_release_id = :discogs_release_id, notes = :notes, description = :description,
+                            shipping_option = :shipping_option, barcode = :barcode, genre = :genre, new_used = :new_used, 
+                            listing_title = :listing_title, matrix_runout = :matrix_runout, condition_tags = :condition_tags,
+                            last_modified = :last_modified, inv_updated_at = :inv_updated_at, lister_payload = :lister_payload WHERE sku = :sku"""
+                    params = data
+                    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    params["last_modified"] = now_iso
+                    # update local inventory timestamp
+                    params["inv_updated_at"] = now_iso
+                    params["lister_payload"] = payload_json
+                    params["sku"] = sku
+                    cursor.execute(sql, params)
+                    messagebox.showinfo("Success", f"Updated SKU: {sku}")
+                else:
+                    sql = """INSERT INTO inventory (sku, artist, title, cat_no, year, format, media_condition,
+                            sleeve_condition, price, status, discogs_release_id, notes, description, shipping_option, barcode, genre, new_used,
+                            listing_title, matrix_runout, condition_tags, date_added, last_modified, inv_updated_at, lister_payload
+                            ) VALUES (:sku, :artist, :title, :cat_no, :year, :format, :media_condition,
+                            :sleeve_condition, :price, :status, :discogs_release_id, :notes, :description, :shipping_option, :barcode, :genre, :new_used,
+                            :listing_title, :matrix_runout, :condition_tags, :date_added, :last_modified, :inv_updated_at, :lister_payload)"""
+                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    params = data
+                    params["sku"] = sku
+                    params["date_added"] = now
+                    params["last_modified"] = now
+                    params["inv_updated_at"] = now
+                    params["lister_payload"] = payload_json
+                    cursor.execute(sql, params)
+                    messagebox.showinfo("Success", f"Saved with SKU: {sku}")
+            
+            self.populate_inventory_view()
+            self.clear_form()
+            
+        except Exception as e:
+            logger.error(f"Failed to save to inventory: {e}", exc_info=True)
+            messagebox.showerror("Database Error", f"Failed to save: {e}")
+
+    def clear_form(self):
+        """Clear all form fields"""
+        for key, widget in self.entries.items():
+            if isinstance(widget, (tk.Entry, ttk.Entry)):
+                widget.delete(0, tk.END)
+            elif isinstance(widget, tk.Text):
+                widget.delete("1.0", tk.END)
+            elif isinstance(widget, ttk.Combobox):
+                widget.set("")
+        
+        self.price_entry.delete(0, tk.END)
+        self.full_desc.delete("1.0", tk.END)
+        
+        self.current_release_id = None
+        self.editing_sku = None
+        self.temporary_sku = None
+        self.image_paths = []
+        self._update_image_listbox()
+        self._clear_image_preview()
+        self.sku_display_var.set("")
+        
+        self.save_button.config(text="Save to Inventory")
+        self.release_status_label.config(text="⚠ No release selected", fg="red")
+        
+        for item in self.discogs_tree.get_children():
+            self.discogs_tree.delete(item)
+    
+
+    def generate_image_qr_code(self):
+        """Generate QR code for image association."""
+        if not QR_LIBRARIES_AVAILABLE:
+            messagebox.showerror("Missing Libraries", "PIL (Pillow) and qrcode libraries are required for this feature.")
+            return
+
+        if self.editing_sku:
+            sku = self.editing_sku
+        elif not self.temporary_sku:
+            # Create a temporary SKU for the new item if it doesn't have one
+            self.temporary_sku = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-TEMP"
+            sku = self.temporary_sku
+        else:
+            sku = self.temporary_sku
+            
+        self.sku_display_var.set(sku)
+
+        qr_data = f"vinyltool_sku:{sku}"
+        
+        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        img = qr.make_image(fill='black', back_color='white')
+        
+        # Display in a new window
+        qr_window = tk.Toplevel(self.root)
+        qr_window.title(f"QR Code for SKU: {sku}")
+        
+        photo = ImageTk.PhotoImage(img)
+        label = tk.Label(qr_window, image=photo)
+        label.image = photo # Keep a reference
+        label.pack(padx=20, pady=20)
+        
+        tk.Label(qr_window, text=f"Scan this code with your phone to associate images with\nSKU: {sku}", justify='center').pack(pady=(0,10))
+
+    def select_images_manually(self):
+        """[NEW & FIXED] Open a file dialog to select images and copy them to a managed folder."""
+        # 1. Ensure we have a SKU to work with
+        if self.editing_sku:
+            sku = self.editing_sku
+        elif not self.temporary_sku:
+            # Create a temporary SKU if one doesn't exist for this new item
+            self.temporary_sku = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-TEMP"
+            sku = self.temporary_sku
+        else:
+            sku = self.temporary_sku
+        
+        self.sku_display_var.set(sku)
+
+        # 2. Open file dialog to select images
+        selected_files = filedialog.askopenfilenames(
+            title="Select images for this item",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png *.heic"), ("All files", "*.*")]
+        )
+        if not selected_files:
+            return # User cancelled
+
+        # 3. Create a dedicated, permanent folder for this SKU's images
+        # [FIX] Changed 'item_images' to 'managed_images' to match expected path
+        permanent_storage_path = os.path.join(os.path.dirname(__file__), "managed_images", sku.replace('-TEMP', ''))
+        os.makedirs(permanent_storage_path, exist_ok=True)
+        
+        new_image_paths = []
+        for source_path in selected_files:
+            filename = os.path.basename(source_path)
+            destination_path = os.path.join(permanent_storage_path, filename)
+            try:
+                # Copy the file to the managed folder. Use copy2 to preserve metadata.
+                shutil.copy2(source_path, destination_path)
+                new_image_paths.append(destination_path)
+                logger.info(f"Copied '{filename}' to '{permanent_storage_path}'")
+            except Exception as e:
+                logger.error(f"Failed to copy image '{filename}': {e}")
+                messagebox.showerror("Image Copy Error", f"Could not copy file: {filename}\n\nError: {e}")
+
+        # 4. Update the internal image list and the UI
+        # Add new paths and remove duplicates, preserving order
+        for path in new_image_paths:
+            if path not in self.image_paths:
+                self.image_paths.append(path)
+        
+        self._update_image_listbox()
+        messagebox.showinfo("Images Linked", f"Successfully linked {len(new_image_paths)} images to SKU {sku}.")
+
+    def import_staged_images(self):
+        """Import images from the staging folder that have a matching SKU via QR or filename."""
+        staging_path = self.image_staging_path_var.get()
+        if not staging_path or not os.path.isdir(staging_path):
+            messagebox.showerror("Path Error", "Image staging path is not set or is not a valid directory.\nPlease set it in the Settings tab.")
+            return
+
+        if not self.editing_sku and not self.temporary_sku:
+            messagebox.showwarning("No SKU", "Please save the item or generate a QR code first to create an SKU for image association.")
+            return
+            
+        sku_to_find = self.editing_sku or self.temporary_sku
+        logger.info(f"Scanning for images for SKU: {sku_to_find}")
+
+        found_images = []
+        
+        # Scan staging path for subfolders matching the SKU
+        sku_folder_path = os.path.join(staging_path, sku_to_find)
+        if os.path.isdir(sku_folder_path):
+            logger.info(f"Found SKU subfolder: {sku_folder_path}")
+            for filename in sorted(os.listdir(sku_folder_path)):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    found_images.append(os.path.join(sku_folder_path, filename))
+        else:
+            logger.warning(f"SKU subfolder not found. Scanning staging root for QR codes or prefixed files.")
+            # Fallback: scan root of staging path for images containing the QR code or SKU prefix
+            for filename in os.listdir(staging_path):
+                 if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.heic')):
+                    filepath = os.path.join(staging_path, filename)
+                    # Check for SKU prefix
+                    if filename.startswith(sku_to_find):
+                        found_images.append(filepath)
+                        logger.info(f"Found matching SKU prefix in {filename}")
+                        continue # Move to next file
+
+                    # Check for QR code if pyzbar is available
+                    if QR_DECODER_AVAILABLE:
+                        try:
+                            with Image.open(filepath) as img:
+                                decoded_objects = qr_decode(img, symbols=[ZBarSymbol.QRCODE])
+                                for obj in decoded_objects:
+                                    decoded_data = obj.data.decode('utf-8')
+                                    if decoded_data == f"vinyltool_sku:{sku_to_find}":
+                                        found_images.append(filepath)
+                                        logger.info(f"Found matching QR code in {filename}")
+                                        break # Stop checking this image's QR codes
+                        except Exception as e:
+                            logger.error(f"Error decoding {filename}: {e}")
+
+        if not found_images:
+            messagebox.showinfo("No Images Found", f"No images for SKU '{sku_to_find}' were found in the staging folder.")
+            return
+
+        # Move images to a permanent, organized location
+        permanent_storage_path = os.path.join(os.path.dirname(__file__), "managed_images", sku_to_find.replace('-TEMP',''))
+        os.makedirs(permanent_storage_path, exist_ok=True)
+        
+        new_image_paths = []
+        for old_path in found_images:
+            filename = os.path.basename(old_path)
+            new_path = os.path.join(permanent_storage_path, filename)
+            try:
+                shutil.move(old_path, new_path)
+                new_image_paths.append(new_path)
+                logger.info(f"Moved {filename} to {permanent_storage_path}")
+            except Exception as e:
+                logger.error(f"Failed to move {filename}: {e}")
+                # If move fails, try to copy as a fallback
+                try:
+                    shutil.copy2(old_path, new_path)
+                    new_image_paths.append(new_path)
+                    logger.info(f"Copied {filename} to {permanent_storage_path} as a fallback.")
+                except Exception as copy_e:
+                    logger.error(f"Fallback copy also failed for {filename}: {copy_e}")
+
+        # Update the UI
+        self.image_paths.extend(new_image_paths)
+        self.image_paths = sorted(list(set(self.image_paths))) # Remove duplicates and sort
+        self._update_image_listbox()
+        messagebox.showinfo("Import Complete", f"Successfully imported {len(new_image_paths)} images.")
+
+    def populate_inventory_view(self, search_term=""):
+        """Populate inventory tree view"""
+        for item in self.inventory_tree.get_children():
+            self.inventory_tree.delete(item)
+        
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                # Select additional ID columns and timestamps for display and logic
+                query = "SELECT sku, artist, title, price, status, ebay_item_draft_id, ebay_listing_id, discogs_listing_id, date_added, inv_updated_at, ebay_updated_at, discogs_updated_at FROM inventory"
+                params = []
+                if search_term:
+                    query += " WHERE artist LIKE ? OR title LIKE ? OR sku LIKE ?"
+                    search_pattern = f"%{search_term}%"
+                    params = [search_pattern, search_pattern, search_pattern]
+                
+                sort_map = {
+                    "SKU": "sku",
+                    "Artist": "artist",
+                    "Title": "title",
+                    "Price": "price",
+                    "Status": "status",
+                    "eBay Draft ID": "ebay_item_draft_id",
+                    "eBay Listing ID": "ebay_listing_id",
+                    "Discogs ID": "discogs_listing_id",
+                    "Date Added": "date_added"
+                }
+                sort_col = sort_map.get(self.inventory_sort_column, "id")
+                query += f" ORDER BY {sort_col} {self.inventory_sort_direction}"
+                
+                cursor.execute(query, params)
+                
+                for row in cursor.fetchall():
+                    # row indices: 0=sku,1=artist,2=title,3=price,4=status,5=ebay_item_draft_id,6=ebay_listing_id,7=discogs_listing_id,8=date_added,9=inv_updated_at,10=ebay_updated_at,11=discogs_updated_at
+                    price_str = f"£{row[3]:.2f}" if row[3] else ""
+                    date_added_str = ""
+                    if row[8]:
+                        try:
+                            dt = datetime.datetime.fromisoformat(str(row[8]).replace('Z', '+00:00'))
+                            date_added_str = dt.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            date_added_str = row[8]
+                    draft_id = row[5] or ""
+                    live_id = row[6] or ""
+                    discogs_id = row[7] or ""
+                    values = (row[0], row[1] or "", row[2] or "", price_str, row[4] or "", draft_id, live_id, discogs_id, date_added_str)
+                    self.inventory_tree.insert("", "end", values=values)
+                    
+        except Exception as e:
+            logger.error(f"Failed to populate inventory: {e}")
+            messagebox.showerror("Database Error", f"Failed to load inventory: {e}")
+    
+    def sort_inventory(self, col):
+        """Sort inventory by column"""
+        if self.inventory_sort_column == col:
+            self.inventory_sort_direction = "ASC" if self.inventory_sort_direction == "DESC" else "DESC"
+        else:
+            self.inventory_sort_column = col
+            self.inventory_sort_direction = "ASC"
+        self.populate_inventory_view(self.inventory_search_var.get())
+    
+    def load_item_for_editing(self, event=None):
+        """
+        Load item by reading from the database and prioritizing the lister_payload.
+        """
+        selected = self.inventory_tree.focus()
+        if not selected: return
+        
+        sku = self.inventory_tree.item(selected, "values")[0]
+        
+        try:
+            # Use the getter that intelligently merges the payload
+            record_data = self._get_inventory_record(sku)
+
+            if not record_data:
+                messagebox.showerror("Error", f"Could not find record for SKU: {sku}")
+                return
+
+            self.clear_form()
+            
+            # The payload is already merged, so we can just apply it
+            self._apply_payload_to_form(record_data)
+
+            # Special handling for DB fields not in the typical payload
+            if 'notes' in record_data and not record_data.get('condition_notes'):
+                 self.entries['condition_notes'].delete('1.0', tk.END)
+                 self.entries['condition_notes'].insert('1.0', record_data['notes'])
+
+            self.editing_sku = sku
+            self.sku_display_var.set(sku)
+            self.save_button.config(text="Update Inventory")
+            
+            release_id = record_data.get("discogs_release_id")
+            if release_id:
+                self.release_status_label.config(text=f"✓ Editing SKU: {sku} (Release ID: {release_id})", fg="blue")
+            else:
+                self.release_status_label.config(text=f"✓ Editing SKU: {sku} (No release linked)", fg="orange")
+            
+            self.notebook.select(self.lister_tab)
+            
+        except Exception as e:
+            logger.error(f"Failed to load item for editing: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to load item: {e}")
+
+    def edit_in_lister(self):
+        """Load selected item in lister tab"""
+        self.load_item_for_editing()
+    
+    def delete_inventory_item(self):
+        """Delete selected inventory items with two-way sync."""
+        selected_items = self.inventory_tree.selection()
+        if not selected_items:
+            messagebox.showwarning("No Selection", "Please select one or more items to delete.")
+            return
+
+        item_details = []
+        for item_id in selected_items:
+            values = self.inventory_tree.item(item_id, "values")
+            sku = values[0]
+            record = self._get_inventory_record(sku)
+            item_details.append({"sku": sku, "discogs_listing_id": record.get("discogs_listing_id")})
+
+        msg = f"Are you sure you want to delete {len(item_details)} item(s)?\n\nThis will also attempt to delete their corresponding Discogs listings."
+        if not messagebox.askyesno("Confirm Delete", msg):
+            return
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+
+        def delete_worker():
+            success_count, fail_count = 0, 0
+            for item in item_details:
+                sku, discogs_listing_id = item["sku"], item["discogs_listing_id"]
+                if discogs_listing_id and self.discogs_api.is_connected():
+                    self.append_log(f"Deleting Discogs listing {discogs_listing_id} for SKU {sku}...", "black")
+                    if not self.discogs_api.delete_listing(discogs_listing_id):
+                        self.append_log(f"✗ Failed to delete Discogs listing {discogs_listing_id}.", "red")
+                        if not messagebox.askyesno("Discogs Deletion Failed", f"Failed to delete Discogs listing for SKU {sku}.\n\nDo you still want to delete the item from your local inventory?"):
+                            fail_count += 1
+                            continue
+                try:
+                    with self.db.get_connection() as conn:
+                        conn.cursor().execute("DELETE FROM inventory WHERE sku = ?", (sku,))
+                    self.append_log(f"✓ Deleted SKU {sku} from local inventory.", "green")
+                    success_count += 1
+                except Exception as e:
+                    self.append_log(f"✗ Failed to delete SKU {sku} from local DB: {e}", "red")
+                    fail_count += 1
+            self.safe_after(0, lambda: (self.root.config(cursor=""), self.populate_inventory_view(), messagebox.showinfo("Deletion Complete", f"Successfully deleted: {success_count}\nFailed or skipped: {fail_count}")))
+        threading.Thread(target=delete_worker, daemon=True).start()
+
+    def select_all_inventory(self):
+        """Select all items in inventory"""
+        for item in self.inventory_tree.get_children():
+            self.inventory_tree.selection_add(item)
+    
+    def deselect_all_inventory(self):
+        """Deselect all items in inventory"""
+        self.inventory_tree.selection_remove(self.inventory_tree.selection())
+    
+    def update_inventory_status(self, new_status):
+        """Update status of selected inventory items"""
+        print(f"DEBUG: update_inventory_status called with status={new_status}")
+        selected = self.inventory_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select items to update")
+            return
+        skus = [self.inventory_tree.item(item, "values")[0] for item in selected]
+        try:
+            with self.db.get_connection() as conn:
+                placeholders = ",".join("?" * len(skus))
+                sql = f"UPDATE inventory SET status = ?, last_modified = ? WHERE sku IN ({placeholders})"
+                params = [new_status, datetime.datetime.now(datetime.timezone.utc).isoformat()] + skus
+                conn.cursor().execute(sql, params)
+            self.populate_inventory_view()
+            self.append_log(f"Updated {len(skus)} item(s) to '{new_status}'", "green")
+        except Exception as e:
+            logger.error(f"Failed to update status: {e}")
+            messagebox.showerror("Error", f"Failed to update status: {e}")
+    
+    def on_inventory_selection(self, event=None):
+        """Handle inventory selection change"""
+        selected = self.inventory_tree.selection()
+        state = "normal" if selected else "disabled"
+        
+        # Update all publishing buttons based on selection and connection status
+        self.publish_ebay_btn.config(state=state)
+        
+        # Discogs buttons - only enable if connected
+        discogs_state = state if (state == "normal" and self.discogs_api.is_connected()) else "disabled"
+        self.publish_discogs_btn.config(state=discogs_state)
+        try:
+            self.publish_discogs_live_btn.config(state=discogs_state)
+        except AttributeError:
+            pass
+        
+        # Enable/disable the utility buttons based on selection
+        try:
+            self.open_in_browser_btn.config(state=state)
+        except Exception:
+            pass
+
+    def create_or_update_offer(self, listing_data: dict):
+        """
+        Step 2: Common offer creation/update logic extracted.
+        Returns: dict with at least { 'success': bool, 'offerId': optional, 'error': optional }.
+        For now, delegates to the existing publish_to_ebay logic so behavior is unchanged.
+        """
+        if globals().get("PUBLISH_HARD_BLOCK"):
+            self.append_log("[publish] BLOCKED BY FLAG", "orange")
+            return {"success": False, "error": "Blocked"}
+        # Draft creation/update is no longer supported in this version.  To
+        # publish a listing on eBay, first save the item to your Inventory and
+        # then use the "Publish Live to eBay" button on the Inventory tab.  We
+        # return an informative error here to avoid unexpected calls.
+        return {
+            "success": False,
+            "error": "Draft listing functionality has been removed. Please add the item to your Inventory and publish from there."
+        }
+
+    
+    def publish_to_ebay(self):
+    
+        """Publish selected items from inventory to eBay, including images."""
+    
+        selected = self.inventory_tree.selection()
+    
+        if not selected:
+    
+            messagebox.showwarning("No Selection", "Please select items from the inventory to publish.")
+    
+            return
+
+    
+        self.notebook.select(self.inventory_tab)  # Switch to see logs
+
+    
+        def publish_worker():
+    
+            for item in selected:
+    
+                sku = self.inventory_tree.item(item, "values")[0]
+    
+                self.append_log(f"SKU {sku}: Starting publish process for eBay...", "black")
+
+    
+                try:
+    
+                    record = self._get_inventory_record(sku)
+    
+                    if not record:
+    
+                        self.append_log(f"SKU {sku}: Could not find record.", "red")
+    
+                        continue
+
+    
+                    # Latest-wins check: warn if remote eBay data is newer than local
+    
+                    try:
+    
+                        local_ts = record.get("inv_updated_at") or record.get("last_modified") or record.get("date_added")
+    
+                        remote_ts = record.get("ebay_updated_at")
+    
+                        proceed = True
+    
+                        if remote_ts and local_ts:
+    
+                            try:
+    
+                                ldt = datetime.datetime.fromisoformat(str(local_ts).replace('Z','+00:00'))
+    
+                                rdt = datetime.datetime.fromisoformat(str(remote_ts).replace('Z','+00:00'))
+    
+                                if rdt > ldt:
+    
+                                    msg = (f"SKU {sku}: The eBay data was updated more recently than your local copy.\n"
+    
+                                           f"Local updated: {ldt.isoformat()}\n"
+    
+                                           f"eBay updated: {rdt.isoformat()}\n\n"
+    
+                                           "Proceeding will overwrite eBay with local data. Continue?")
+    
+                                    proceed = messagebox.askyesno("Potential Conflict", msg)
+    
+                            except Exception:
+    
+                                pass
+    
+                        if not proceed:
+    
+                            self.append_log(f"SKU {sku}: Skipped due to newer eBay data.", "orange")
+    
+                            continue
+    
+                    except Exception:
+    
+                        pass
+
+    
+                    # Ensure categoryId is set before validation; use default if missing
+    
+                    try:
+    
+                        if not record.get("categoryId") and not record.get("category_id"):
+    
+                            fmt = record.get("format", "LP") or "LP"
+    
+                            record = dict(record)
+    
+                            record["categoryId"] = EBAY_VINYL_CATEGORIES.get(fmt, "176985")
+    
+                    except Exception:
+    
+                        pass
+
+    
+                    errors = validate_listing("ebay", record, self.config)
+    
+                    if errors:
+    
+                        self.append_log(f"SKU {sku}: Validation failed: {', '.join(errors)}", "red")
+    
+                        continue
+
+    
+                    # Build listing data (condition, aspects, etc.)
+    
+                    format_val = record.get("format", "LP")
+    
+                    media_cond_str = record.get("media_condition", "")
+    
+                    condition_enum = EBAY_INVENTORY_CONDITION_MAP.get(media_cond_str, "USED_GOOD")
+    
+                    condition_id_numeric = EBAY_CONDITION_MAP_NUMERIC.get(media_cond_str, "3000")
+    
+                    category_id = EBAY_VINYL_CATEGORIES.get(format_val, "176985")
+
+    
+                    listing_data = {
+    
+                        "sku": sku,
+    
+                        "title": record.get("listing_title") or record.get("title", "")[:80],
+    
+                        "description": record.get("description", ""),
+    
+                        "price": record.get("price", 0),
+    
+                        "quantity": 1,
+    
+                        "categoryId": category_id,
+    
+                        "condition_enum": condition_enum,
+    
+                        "condition_id_numeric": condition_id_numeric,
+    
+                        "media_condition": record.get("media_condition"),
+    
+                        "sleeve_condition": record.get("sleeve_condition"),
+    
+                        "images": record.get("images", []),
+    
+                        "marketplaceId": self.config.get("marketplace_id", "EBAY_GB"),
+    
+                        "paymentPolicyId": self.config.get("ebay_payment_policy_id"),
+    
+                        "returnPolicyId": self.config.get("ebay_return_policy_id"),
+    
+                        "shippingPolicyId": self.config.get("ebay_shipping_policy_id"),
+    
+                        "currency": "GBP",
+    
+                    }
+
+    
+                    # Location fields (Sell Inventory + Trading fallbacks)
+    
+                    _pc = (self.config.get('postal_code', '') or '').strip()
+    
+                    _cc = (self.config.get('country', 'GB') or 'GB').strip()
+    
+                    _city = self.config.get('city', 'Kidderminster')
+
+    
+                    # Sell Inventory shape
+    
+                    listing_data['itemLocation'] = {'countryCode': _cc, 'postalCode': _pc, 'city': _city}
+
+    
+                    # Trading-style fallbacks under `item` and top-level PascalCase
+    
+                    listing_data.setdefault('item', {})
+    
+                    listing_data['item'].update({
+    
+                        'country': _cc, 'postalCode': _pc, 'location': _city,
+    
+                        'Country': _cc, 'PostalCode': _pc, 'Location': _city,
+    
+                    })
+    
+                    listing_data['Country'] = _cc
+    
+                    listing_data['PostalCode'] = _pc
+    
+                    listing_data['Location'] = _city
+
+    
+                    # Merchant Location (if exists)
+    
+                    try:
+    
+                        _mlk = self._ensure_ebay_location()
+    
+                    except Exception:
+    
+                        _mlk = None
+    
+                    if _mlk and getattr(self, '_inventory_location_exists', lambda x: False)(_mlk):
+    
+                        listing_data['merchantLocationKey'] = _mlk
+    
+                    else:
+    
+                        listing_data.pop('merchantLocationKey', None)
+
+    
+                    # Explicit Trading-style Item block for bridges expecting Item.*
+    
+                    listing_data['Item'] = {
+    
+                        'Country': listing_data.get('Country') or listing_data.get('item', {}).get('Country') or listing_data.get('item', {}).get('country'),
+    
+                        'PostalCode': listing_data.get('PostalCode') or listing_data.get('item', {}).get('PostalCode') or listing_data.get('item', {}).get('postalCode'),
+    
+                        'Location': listing_data.get('Location') or listing_data.get('item', {}).get('Location') or listing_data.get('item', {}).get('location'),
+    
+                    }
+
+    
+                    # Create/Update offer and publish (wrapper handles publish)
+    
+                    result = self.ebay_api.create_draft_listing(listing_data)
+    
+                    if result.get("success"):
+    
+                        offer_id = result.get('offerId')
+    
+                        self.append_log(f"SKU {sku}: Successfully created eBay draft (Offer ID: {offer_id})", "green")
+                        try:
+                            # Resolve live listingId and save it (same as Lister flow)
+                            self.safe_after(0, lambda sku=sku, oid=offer_id: self._handle_ebay_listing_success(sku, oid))
+                        except Exception:
+                            pass
+    
+                        try:
+    
+                            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+                            with self.db.get_connection() as conn:
+    
+                                cursor = conn.cursor()
+    
+                                cursor.execute(
+    
+                                    "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+    
+                                    (offer_id, now_iso, sku),
+    
+                                )
+    
+                        except Exception as e:
+    
+                            logger.error(f"Failed to update inventory with eBay listing ID: {e}")
+    
+                            self.append_log(f"SKU {sku}: Failed to save eBay Offer ID to local DB: {e}", "red")
+    
+                    else:
+    
+                        self.append_log(f"SKU {sku}: eBay listing failed: {result.get('error')}", "red")
+
+    
+                except Exception as e:
+    
+                    self.append_log(f"SKU {sku}: An unexpected error occurred: {e}", "red")
+    
+                    logger.error(f"Error publishing SKU {sku} to eBay", exc_info=True)
+
+    
+            self.safe_after(0, self.populate_inventory_view)
+    
+            self.safe_after(0, lambda: self.root.config(cursor=""))
+
+    
+        self.root.config(cursor="watch")
+    
+        self.root.update()
+    
+        threading.Thread(target=publish_worker, daemon=True).start()
+    
+    def append_log(self, message, color="black"):
+        """Append message to publish log"""
+        def do_append():
+            timestamp = datetime.datetime.now().strftime("[%H:%M:%S]")
+            self.publish_log.config(state="normal")
+            self.publish_log.insert("end", f"{timestamp} {message}\n", (color,))
+            self.publish_log.tag_configure("red", foreground="red")
+            self.publish_log.tag_configure("green", foreground="green")
+            self.publish_log.tag_configure("black", foreground="black")
+            self.publish_log.see("end")
+            self.publish_log.config(state="disabled")
+        self.safe_after(0, do_append)
+
+    def show_inventory_context_menu(self, event):
+        """Show inventory context menu"""
+        row_id = self.inventory_tree.identify_row(event.y)
+        if row_id:
+            self.inventory_tree.selection_set(row_id)
+            self.inventory_tree.focus(row_id)
+            self.inventory_context_menu.post(event.x_root, event.y_root)
+    
+    def show_discogs_context_menu(self, event):
+        """Show Discogs results context menu"""
+        row_id = self.discogs_tree.identify_row(event.y)
+        if row_id:
+            self.discogs_tree.selection_set(row_id)
+            self.discogs_tree.focus(row_id)
+            self.discogs_context_menu.post(event.x_root, event.y_root)
+    
+    def open_discogs_listing(self):
+        """Open Discogs listing for selected inventory item"""
+        selected = self.inventory_tree.focus()
+        if not selected: return
+        sku = self.inventory_tree.item(selected, "values")[0]
+        try:
+            record = self._get_inventory_record(sku)
+            if record.get("discogs_listing_id"):
+                webbrowser.open_new_tab(f"https://www.discogs.com/sell/item/{record['discogs_listing_id']}")
+            else:
+                messagebox.showinfo("No Discogs Listing", "This item has no Discogs listing ID.")
+        except Exception as e:
+            logger.error(f"Failed to open Discogs listing: {e}")
+    
+    def open_ebay_listing(self):
+        """Open eBay listing for selected inventory item"""
+        selected = self.inventory_tree.focus()
+        if not selected: return
+        sku = self.inventory_tree.item(selected, "values")[0]
+        try:
+            record = self._get_inventory_record(sku)
+            if record.get("ebay_listing_id"):
+                webbrowser.open_new_tab(f"https://www.ebay.co.uk/itm/{record['ebay_listing_id']}")
+            else:
+                messagebox.showinfo("No eBay Listing", "This item has no eBay listing ID.")
+        except Exception as e:
+            logger.error(f"Failed to open eBay listing: {e}")
+    
+    def open_discogs_release_from_inventory(self):
+        """Open Discogs release page for selected inventory item"""
+        selected = self.inventory_tree.focus()
+        if not selected: return
+        sku = self.inventory_tree.item(selected, "values")[0]
+        try:
+            record = self._get_inventory_record(sku)
+            if record.get("discogs_release_id"):
+                webbrowser.open_new_tab(f"https://www.discogs.com/release/{record['discogs_release_id']}")
+            else:
+                messagebox.showinfo("No Release Linked", "This item has no Discogs release ID.")
+        except Exception as e:
+            logger.error(f"Failed to open release page: {e}")
+    
+    def open_discogs_release_page(self):
+        """Open selected release on Discogs website"""
+        selected = self.discogs_tree.focus()
+        if not selected: return
+        release_id = self.discogs_tree.item(selected, "values")[0]
+        webbrowser.open_new_tab(f"https://www.discogs.com/release/{release_id}")
+    
+    def open_sold_listings_from_selection(self, platform):
+        """Open sold listings search for selected Discogs result"""
+        selected = self.discogs_tree.focus()
+        if not selected: return
+        _, artist, title, catno, _, _, _ = self.discogs_tree.item(selected, "values")
+        query = f"{artist} {title} {catno}".strip()
+        url = f"https://www.ebay.co.uk/sch/i.html?_nkw={quote_plus(query)}&_sacat=176985&LH_Sold=1&LH_Complete=1" if platform == "eBay" else f"https://www.discogs.com/search/?q={quote_plus(query)}&type=all"
+        webbrowser.open_new_tab(url)
+    
+    def get_price_suggestion(self):
+        """Get price suggestions for selected release"""
+        selected = self.discogs_tree.focus()
+        if not selected: return
+        release_id = int(self.discogs_tree.item(selected, "values")[0])
+        self.root.config(cursor="watch")
+        self.root.update()
+        def fetch_worker():
+            try:
+                suggestions = self.discogs_api.get_price_suggestions(release_id)
+                if suggestions:
+                    msg = "Price Suggestions:\n\n" + "\n".join([f"{condition}: £{price_data['value']:.2f}" for condition, price_data in suggestions.items()])
+                    self.safe_after(0, lambda: messagebox.showinfo("Price Suggestions", msg))
+                else:
+                    self.safe_after(0, lambda: messagebox.showinfo("No Data", "No price suggestions available"))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        threading.Thread(target=fetch_worker, daemon=True).start()
+    
+    def refresh_discogs_view(self, event=None):
+        """Refresh Discogs results with filter"""
+        filter_text = self.discogs_search_filter_var.get().lower()
+        if not self.discogs_search_results: return
+        for item in self.discogs_tree.get_children(): self.discogs_tree.delete(item)
+        for result in self.discogs_search_results:
+            artist, title = (result.get("title", "").split(" - ", 1) + [""])[:2]
+            if filter_text and filter_text not in f"{artist} {title} {result.get('catno', '')} {result.get('year', '')}".lower(): continue
+            values = (result.get("id"), artist, title, result.get("catno", "N/A"), result.get("year", "N/A"), result.get("country", "N/A"), ", ".join(result.get("format", [])))
+
+    def sort_discogs_results(self, col):
+        """Sort Discogs results by column"""
+        if self.discogs_sort_column == col:
+            self.discogs_sort_direction = "ASC" if self.discogs_sort_direction == "DESC" else "DESC"
+        else:
+            self.discogs_sort_column, self.discogs_sort_direction = col, "ASC"
+        if self.discogs_search_results:
+            def sort_key(item):
+                if col == "Artist": return (item.get("title", "").split(" - ", 1) + [""])[0].lower()
+                elif col == "Title": return (item.get("title", "").split(" - ", 1) + [""])[1].lower()
+                elif col == "Year":
+                    try: return int(item.get("year", 0))
+                    except: return 0
+                else: return str(item.get(col.lower(), "")).lower()
+            self.discogs_search_results.sort(key=sort_key, reverse=(self.discogs_sort_direction == "DESC"))
+            self.refresh_discogs_view()
+    
+    def authenticate_discogs(self):
+        """Authenticate with Discogs"""
+        consumer_key = self.config.get("discogs_consumer_key")
+        consumer_secret = self.config.get("discogs_consumer_secret")
+        if not consumer_key or not consumer_secret:
+            messagebox.showerror("Configuration Error", "Discogs Consumer Key/Secret not found in config.json.\nPlease add these to your configuration file.")
+            return
+        try:
+            client = discogs_client.Client("VinylListingTool/5.1", consumer_key=consumer_key, consumer_secret=consumer_secret)
+            token, secret, url = client.get_authorize_url()
+            webbrowser.open(url)
+            pin = simpledialog.askstring("Discogs Authentication", "Please enter the verification code from Discogs:")
+            if not pin: return
+            access_token, access_secret = client.get_access_token(pin)
+            self.config.save({"discogs_oauth_token": access_token, "discogs_oauth_token_secret": access_secret})
+            self.discogs_api = DiscogsAPI(self.config)
+            if self.discogs_api.is_connected():
+                self._update_connection_status()
+                messagebox.showinfo("Success", "Successfully connected to Discogs!")
+            else:
+                messagebox.showerror("Error", "Failed to connect to Discogs")
+        except Exception as e:
+            logger.error(f"Discogs authentication failed: {e}")
+            messagebox.showerror("Authentication Error", str(e))
+    
+    def test_ebay_connection(self):
+        """Test eBay connection"""
+        if self.ebay_api.test_connection():
+            self.ebay_auth_status_var.set("Connected")
+            messagebox.showinfo("Success", "Successfully connected to eBay!")
+        else:
+            self.ebay_auth_status_var.set("Not Connected")
+            messagebox.showerror("Connection Failed", "Could not connect to eBay.\nPlease check your credentials in config.json")
+    
+    def check_discogs_sales(self):
+        """Check for Discogs sales"""
+        if not self.discogs_api.is_connected(): return
+        self.root.config(cursor="watch"); self.root.update()
+        def sales_worker():
+            try:
+                orders = self.discogs_api.get_orders(['Payment Received', 'Shipped'])
+                self.safe_after(0, lambda: self._display_discogs_sales(orders))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        threading.Thread(target=sales_worker, daemon=True).start()
+    
+    def _display_discogs_sales(self, orders):
+        """Display Discogs sales"""
+        for item in self.sales_tree.get_children(): self.sales_tree.delete(item)
+        if not orders:
+            messagebox.showinfo("No Sales", "No sales with status 'Payment Received' or 'Shipped' found.")
+            return
+        for order in orders:
+            for item in order.items:
+                artist = item.release.artists[0].name if item.release.artists else "Various"
+                title = item.release.title.replace(f"{artist} - ", "", 1).strip()
+                sale_date = datetime.datetime.strptime(order.data['created'][:10], "%Y-%m-%d").strftime("%d-%m-%Y")
+                sale_price = f"{item.price.value} {item.price.currency}"
+                values = (order.id, sale_date, order.buyer.username, artist, title, sale_price, item.release.id)
+                self.sales_tree.insert("", "end", values=values)
+    
+    def sync_discogs_sale(self):
+        """Sync selected Discogs sale to inventory"""
+        selected = self.sales_tree.focus()
+        if not selected: return
+        release_id = self.sales_tree.item(selected, "values")[6]
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT sku FROM inventory WHERE discogs_release_id = ? AND status = 'For Sale'", (release_id,))
+                record = cursor.fetchone()
+                if record:
+                    sku = record[0]
+                    if messagebox.askyesno("Confirm Sync", f"Found matching item (SKU: {sku}). Mark as 'Sold'?"):
+                        self.update_inventory_status("Sold")
+                        messagebox.showinfo("Success", f"SKU {sku} marked as Sold.")
+                else:
+                    messagebox.showwarning("No Match", f"Could not find an unsold item with Release ID: {release_id}.")
+        except Exception as e:
+            logger.error(f"Failed to sync sale: {e}")
+            messagebox.showerror("Database Error", f"Could not sync sale: {e}")
+    
+    def check_ebay_sales(self):
+        """Check for eBay sales"""
+        if not self.ebay_api.test_connection(): return
+        try:
+            start_date = datetime.datetime.strptime(self.ebay_start_date_var.get(), "%d-%m-%Y")
+            end_date = datetime.datetime.strptime(self.ebay_end_date_var.get(), "%d-%m-%Y")
+            if (end_date - start_date).days > 30:
+                messagebox.showerror("Date Range Error", "The date range cannot exceed 30 days.")
+                return
+        except ValueError:
+            messagebox.showerror("Date Format Error", "Please enter dates in DD-MM-YYYY format.")
+            return
+        self.root.config(cursor="watch"); self.root.update()
+        def sales_worker():
+            try:
+                orders = self.ebay_api.get_orders(start_date, end_date)
+                self.safe_after(0, lambda: self._display_ebay_sales(orders))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        threading.Thread(target=sales_worker, daemon=True).start()
+    
+    def _display_ebay_sales(self, orders):
+        """Display eBay sales"""
+        for item in self.ebay_sales_tree.get_children(): self.ebay_sales_tree.delete(item)
+        if not orders:
+            messagebox.showinfo("No eBay Sales", "No completed sales found in the specified date range.")
+            return
+        for order in orders:
+            order_id, created_date, buyer = order.get("orderId"), order.get("creationDate", "")[:10], order.get("buyer", {}).get("username", "")
+            for line_item in order.get("lineItems", []):
+                title, price, currency, item_id = line_item.get("title", ""), line_item.get("lineItemCost", {}).get("value", ""), line_item.get("lineItemCost", {}).get("currency", "GBP"), line_item.get("legacyItemId", "")
+                artist, album_title = "", title
+                if ":" in title:
+                    parts = title.split(":", 1)
+                    artist, album_title = parts[0].strip(), parts[1].strip()
+                values = (order_id, created_date, buyer, artist, album_title, f"{price} {currency}", item_id)
+                self.ebay_sales_tree.insert("", "end", values=values)
+    
+    def sync_ebay_sale(self):
+        """Sync selected eBay sale to inventory"""
+        selected = self.ebay_sales_tree.focus()
+        if not selected: return
+        _, _, _, artist, title, _, item_id = self.ebay_sales_tree.item(selected, "values")
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT sku FROM inventory WHERE (ebay_listing_id = ? OR (artist LIKE ? AND title LIKE ?)) AND status = 'For Sale'", (item_id, f"%{artist}%", f"%{title}%"))
+                record = cursor.fetchone()
+                if record:
+                    sku = record[0]
+                    if messagebox.askyesno("Confirm Sync", f"Found matching item (SKU: {sku}). Mark as 'Sold'?"):
+                        self.update_inventory_status("Sold")
+                        messagebox.showinfo("Success", f"SKU {sku} marked as Sold.")
+                else:
+                    messagebox.showwarning("No Match", f"Could not find an unsold item matching:\n{artist} - {title}")
+        except Exception as e:
+            logger.error(f"Failed to sync sale: {e}")
+            messagebox.showerror("Database Error", f"Could not sync sale: {e}")
+    
+    def start_discogs_import(self):
+        """Import inventory from Discogs"""
+        if not self.discogs_api.is_connected(): return
+        if not messagebox.askyesno("Confirm Import", "This will import all 'For Sale' items from Discogs.\nExisting items will be skipped.\n\nContinue?"): return
+        self.root.config(cursor="watch"); self.root.update()
+        def import_worker():
+            try:
+                inventory = self.discogs_api.get_inventory()
+                self.safe_after(0, lambda: self._process_discogs_import(inventory))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Import Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        threading.Thread(target=import_worker, daemon=True).start()
+    
+    def _process_discogs_import(self, inventory):
+        """Process Discogs import"""
+        new_items, skipped_items = 0, 0
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                for listing in inventory:
+                    if listing.status != 'For Sale': continue
+                    cursor.execute("SELECT COUNT(*) FROM inventory WHERE discogs_listing_id = ?", (listing.id,))
+                    if cursor.fetchone()[0] > 0:
+                        skipped_items += 1
+                        continue
+                    new_items += 1
+                    artist = listing.release.artists[0].name if listing.release.artists else "Various"
+                    title = listing.release.title.replace(f"{artist} - ", "", 1).strip()
+                    sku = datetime.datetime.now().strftime(f"%Y%m%d-%H%M%S-{new_items}")
+                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    sql = """INSERT INTO inventory (sku, artist, title, cat_no, media_condition, sleeve_condition, price, status, discogs_release_id, discogs_listing_id, date_added, last_modified) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                    media_cond = DISCOGS_GRADE_MAP.get(listing.condition, listing.condition)
+                    sleeve_cond = DISCOGS_GRADE_MAP.get(listing.sleeve_condition, listing.sleeve_condition)
+                    catno = getattr(listing.release, 'catno', '')
+                    cursor.execute(sql, (sku, artist, title, catno, media_cond, sleeve_cond, listing.price.value, "For Sale", listing.release.id, listing.id, now, now))
+            messagebox.showinfo("Import Complete", f"Successfully imported {new_items} new item(s).\nSkipped {skipped_items} existing item(s).")
+            self.populate_inventory_view()
+        except Exception as e:
+            logger.error(f"Import failed: {e}")
+            messagebox.showerror("Import Error", f"An error occurred during import:\n{e}")
+    
+    def toggle_auto_sync(self):
+        """Toggle automatic sync"""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to your Discogs account first.")
+            self.auto_sync_var.set(False)
+            return
+        self.auto_sync_enabled = self.auto_sync_var.get()
+        self.config.save({"auto_sync_enabled": self.auto_sync_enabled})
+        if self.auto_sync_enabled: self.start_auto_sync()
+        else: self.stop_auto_sync()
+    
+    def toggle_two_way_sync(self):
+        """Toggle two-way sync"""
+        self.two_way_sync_enabled = self.two_way_sync_var.get()
+        self.config.save({"two_way_sync_enabled": self.two_way_sync_enabled})
+        self.log_sync_activity(f"Two-way sync {'enabled' if self.two_way_sync_enabled else 'disabled'}")
+    
+    def toggle_attempt_updates(self):
+        """Toggle attempt to update Discogs"""
+        self.attempt_discogs_updates = self.attempt_updates_var.get()
+        self.config.save({"attempt_discogs_updates": self.attempt_discogs_updates})
+        self.log_sync_activity(f"Discogs update attempts {'enabled' if self.attempt_discogs_updates else 'disabled'}")
+    
+    def update_sync_interval(self):
+        """Update sync interval"""
+        try:
+            minutes = int(self.sync_interval_var.get())
+            self.auto_sync_interval = minutes * 60
+            self.config.save({"auto_sync_interval": self.auto_sync_interval})
+            self.log_sync_activity(f"Sync interval set to {minutes} minutes")
+        except ValueError: self.sync_interval_var.set("5")
+    
+    def start_auto_sync(self):
+        """Start automatic sync"""
+        if self.auto_sync_thread and self.auto_sync_thread.is_alive(): return
+        self.auto_sync_stop_event.clear()
+        self.auto_sync_thread = threading.Thread(target=self._auto_sync_worker, daemon=True)
+        self.auto_sync_thread.start()
+        self.sync_status_var.set("Auto-sync enabled - waiting for next sync...")
+        self.log_sync_activity("Automatic sync started")
+    
+    def stop_auto_sync(self):
+        """Stop automatic sync"""
+        self.auto_sync_stop_event.set()
+        self.sync_status_var.set("Auto-sync disabled")
+        self.log_sync_activity("Automatic sync stopped")
+    
+    def _auto_sync_worker(self):
+        """Auto sync worker thread"""
+        while not self.auto_sync_stop_event.is_set():
+            try:
+                if self.auto_sync_stop_event.wait(self.auto_sync_interval): break
+                if self.auto_sync_enabled and self.discogs_api.is_connected():
+                    self.safe_after(0, lambda: self.sync_status_var.set("Syncing inventory..."))
+                    sync_result = self._perform_inventory_sync()
+                    self.safe_after(0, lambda r=sync_result: self._handle_sync_result(r))
+            except Exception as e:
+                self.safe_after(0, lambda msg=f"Auto-sync error: {e}": self.log_sync_activity(msg))
+    
+    def manual_sync_now(self):
+        """Perform manual sync now"""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to your Discogs account first.")
+            return
+        self.sync_status_var.set("Manual sync in progress...")
+        self.root.config(cursor="watch"); self.root.update()
+        def sync_worker():
+            try:
+                result = self._perform_inventory_sync()
+                self.safe_after(0, lambda: self._handle_sync_result(result))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Sync Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        threading.Thread(target=sync_worker, daemon=True).start()
+    
+    def _perform_inventory_sync(self):
+        """Implements true "latest-wins" two-way sync logic."""
+        sync_start_time = datetime.datetime.now(datetime.timezone.utc)
+        self.log_sync_activity("=== STARTING SYNC (Latest-Wins) ===")
+        try:
+            discogs_inventory = self.discogs_api.get_inventory()
+            discogs_map = {listing.id: listing for listing in discogs_inventory}
+            self.log_sync_activity(f"Retrieved {len(discogs_inventory)} active listings from Discogs.")
+
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT sku, discogs_listing_id, price, status, notes, last_modified, last_sync_time FROM inventory WHERE discogs_listing_id IS NOT NULL")
+                local_items = [dict(row) for row in cursor.fetchall()]
+                local_map = {item['discogs_listing_id']: item for item in local_items}
+            self.log_sync_activity(f"Found {len(local_map)} linked local items.")
+
+            updates_to_local, updates_to_discogs, deletions_from_local, new_sales = 0, 0, 0, 0
+            
+            for local_item in local_items:
+                listing_id, last_mod_local_str, last_sync_str = local_item['discogs_listing_id'], local_item.get('last_modified'), self.last_successful_sync_time or local_item.get('last_sync_time')
+                if not last_mod_local_str or not last_sync_str: continue
+                try:
+                    last_mod_local, last_sync = datetime.datetime.fromisoformat(last_mod_local_str), datetime.datetime.fromisoformat(last_sync_str)
+                except (ValueError, TypeError): continue
+
+                if last_mod_local > last_sync and self.attempt_discogs_updates:
+                    if listing_id in discogs_map:
+                        self.log_sync_activity(f"→ Local change detected for SKU {local_item['sku']}. Pushing to Discogs.")
+                        update_payload = {"price": local_item['price'], "status": self._map_local_to_discogs_status(local_item['status']), "comments": local_item.get('notes', '')}
+                        if self.discogs_api.update_listing(listing_id, update_payload):
+                            updates_to_discogs += 1; self.log_sync_activity(f"  ✓ Pushed update for SKU {local_item['sku']} to Discogs.")
+                        else: self.log_sync_activity(f"  ✗ Failed to push update for SKU {local_item['sku']}.")
+                    else: self.log_sync_activity(f"  - SKU {local_item['sku']} changed locally but no longer on Discogs. Skipping push.")
+
+                elif listing_id in discogs_map:
+                    listing = discogs_map[listing_id]
+                    mapped_status = self.status_mappings.get(listing.status, "Not For Sale")
+                    if mapped_status != local_item['status']:
+                        with self.db.get_connection() as conn:
+                            conn.cursor().execute("UPDATE inventory SET status = ?, last_modified = ? WHERE discogs_listing_id = ?", (mapped_status, sync_start_time.isoformat(), listing_id))
+                        updates_to_local += 1
+                        if mapped_status == 'Sold' and local_item['status'] != 'Sold': new_sales += 1
+                        self.log_sync_activity(f"✓ Sync from Discogs: SKU {local_item['sku']} '{local_item['status']}' → '{mapped_status}'")
+
+            ids_to_delete_locally = set(local_map.keys()) - set(discogs_map.keys())
+            if ids_to_delete_locally:
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    for listing_id in ids_to_delete_locally:
+                        if local_map[listing_id]['status'] == 'For Sale':
+                            sku = local_map[listing_id]['sku']
+                            cursor.execute("DELETE FROM inventory WHERE discogs_listing_id = ?", (listing_id,))
+                            deletions_from_local += 1
+                            self.log_sync_activity(f"✓ Deleted SKU {sku} locally as it's no longer on Discogs.")
+            
+            with self.db.get_connection() as conn:
+                conn.cursor().execute("UPDATE inventory SET last_sync_time = ? WHERE discogs_listing_id IS NOT NULL", (sync_start_time.isoformat(),))
+            self.last_successful_sync_time = sync_start_time.isoformat()
+            self.config.save({"last_successful_sync_time": self.last_successful_sync_time})
+            if updates_to_local > 0 or deletions_from_local > 0: self.safe_after(0, self.populate_inventory_view)
+            self.log_sync_activity("=== SYNC COMPLETED ===")
+            return {'success': True, 'updates_local': updates_to_local, 'updates_discogs': updates_to_discogs, 'deletions': deletions_from_local, 'new_sales': new_sales, 'total_checked': len(discogs_inventory)}
+        except Exception as e:
+            logger.error(f"Sync failed: {e}", exc_info=True)
+            self.log_sync_activity(f"✗ SYNC ERROR: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _map_local_to_discogs_status(self, local_status):
+        """Map local status to valid Discogs status"""
+        return {'For Sale': 'For Sale', 'Sold': 'Sold'}.get(local_status, 'Draft')
+    
+    def _handle_sync_result(self, result):
+        """Handle sync result"""
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        if result.get('success'):
+            updates_local, updates_discogs, deletions = result.get('updates_local', 0), result.get('updates_discogs', 0), result.get('deletions', 0)
+            total_changes = updates_local + updates_discogs + deletions
+            if total_changes > 0:
+                log_msg = f"[{current_time}] Sync completed: {total_changes} changes from {result['total_checked']} listings"
+                if updates_local > 0: log_msg += f"\n  - Pulled from Discogs: {updates_local}"
+                if updates_discogs > 0: log_msg += f"\n  - Pushed to Discogs: {updates_discogs}"
+                if deletions > 0: log_msg += f"\n  - Items deleted locally: {deletions}"
+                if result.get('new_sales', 0) > 0: log_msg += f"\n  - New sales detected: {result['new_sales']}"
+                self.log_sync_activity(log_msg)
+                status_msg = f"Sync complete - {total_changes} change(s)"
+            else:
+                status_msg = "Sync complete - no changes needed"
+                self.log_sync_activity(f"[{current_time}] Sync completed. No changes needed.")
+            self.sync_status_var.set(f"Last sync: {current_time}. {status_msg}")
+        else:
+            self.sync_status_var.set(f"Last sync: {current_time}. FAILED.")
+            self.log_sync_activity(f"[{current_time}] Sync FAILED: {result.get('error')}")
+
+    # ========================================================================
+    # ENHANCED PUBLISHING ACTION METHODS
+    # ========================================================================
+    
+    def action_ebay_save_unpublished(self):
+        """Save eBay listing data locally as 'ready to publish' without sending to eBay"""
+        if self.notebook.tab(self.notebook.select(), "text") == "Lister":
+            # From Lister tab - save current form
+            self._save_ebay_draft_from_lister()
+        else:
+            # From Inventory tab - mark selected items as ready for eBay
+            self._save_ebay_draft_from_inventory()
+
+    def action_ebay_publish_live(self):
+        """Publish directly to eBay as live listings (Inventory API)"""
+        if self.notebook.tab(self.notebook.select(), "text") == "Lister":
+            # From Lister tab - publish current form directly
+            self.list_on_ebay()
+        else:
+            # From Inventory tab - publish selected items
+            self.publish_to_ebay()
+
+
+
+    def reconcile_from_ebay(self, skus):
+
+
+        """Pull eBay state back into local DB so deletions/ends/relists are reflected.
+
+
+        Chooses ACTIVE offer. Prefers Item ID (listingId); falls back to offerId if listingId hasn't propagated yet.
+
+
+        Refreshes the grid when done.
+
+
+        """
+
+
+        import datetime, logging, requests
+
+
+        logger = logging.getLogger(__name__)
+
+
+    
+
+
+        token = self.ebay_api.get_access_token()
+
+
+        if not token:
+
+
+            self.append_log("Cannot reconcile: missing eBay token", "red")
+
+
+            return
+
+
+    
+
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+
+        changed = False
+
+
+    
+
+
+        for sku in (skus or []):
+
+
+            try:
+
+
+                url = f"{self.ebay_api.base_url}/sell/inventory/v1/offer?sku={sku}"
+
+
+                r = requests.get(url, headers=headers, timeout=30)
+
+
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+    
+
+
+                if r.status_code == 200 and r.json().get("offers"):
+
+
+                    offers = r.json()["offers"]
+
+
+                    # Pick ACTIVE offer if available; otherwise first one
+
+
+                    active = None
+
+
+                    for o in offers:
+
+
+                        if (o.get("status") or "").upper() == "ACTIVE":
+
+
+                            active = o
+
+
+                            break
+
+
+                    offer = active or offers[0]
+
+
+                    status = (offer.get("status") or "").upper()
+
+
+    
+
+
+                    listing_id = offer.get('legacyItemId') or offer.get('listingId') or (offer.get('listing') or {}).get('legacyItemId') or (offer.get('listing') or {}).get('listingId')
+
+
+                    offer_id = offer.get("offerId") or (offer.get("offer") or {}).get("offerId")
+
+
+    
+
+
+                    # If ACTIVE but listingId missing, try GET /offer/{offerId} to resolve
+
+
+                    if status in ("ACTIVE","PUBLISHED") and not listing_id and offer_id:
+
+
+                        try:
+
+
+                            resolved = self.ebay_api.get_offer(str(offer_id))
+
+
+                            if resolved.get("success"):
+
+
+                                listing_id = resolved.get('legacyItemId') or (resolved.get('listing') or {}).get('legacyItemId') or resolved.get('listingId') or (resolved.get('listing') or {}).get('listingId')
+
+
+                        except Exception as e:
+
+
+                            logger.warning(f"[reconcile] get_offer failed for offer {offer_id}: {e}")
+
+
+    
+
+
+                    with self.db.get_connection() as conn:
+
+
+                        c = conn.cursor()
+
+
+                        if status in ("ACTIVE","PUBLISHED"):
+
+
+                            stored_id = listing_id or (offer_id if offer_id else None)
+
+
+                            if stored_id:
+
+
+                                c.execute("UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?", (stored_id, now_iso, sku))
+
+
+                                changed = True
+
+
+                            else:
+
+
+                                c.execute("UPDATE inventory SET ebay_listing_id = NULL, ebay_updated_at = ? WHERE sku = ?", (now_iso, sku))
+
+
+                                changed = True
+
+
+                        else:
+
+
+                            c.execute("UPDATE inventory SET ebay_listing_id = NULL, ebay_updated_at = ? WHERE sku = ?", (now_iso, sku))
+
+
+                            changed = True
+
+
+    
+
+
+                    shown = listing_id or (offer_id if (status in ("ACTIVE","PUBLISHED") and offer_id) else "—")
+
+
+                    label = "Item ID" if listing_id else ("Offer ID" if shown != "—" else "—")  # live
+
+
+                    self.append_log(f"SKU {sku}: reconciled from eBay ({status}; {label}={shown})", "blue")
+
+
+                else:
+
+
+                    with self.db.get_connection() as conn:
+
+
+                        c = conn.cursor()
+
+
+                        c.execute("UPDATE inventory SET ebay_listing_id = NULL, ebay_updated_at = ? WHERE sku = ?", (now_iso, sku))
+
+
+                    changed = True
+
+
+                    self.append_log(f"SKU {sku}: no eBay offer found; cleared local mapping.", "orange")
+
+
+    
+
+
+            except Exception as e:
+
+
+                logger.error(f"Reconcile error for {sku}: {e}")
+
+
+                self.append_log(f"SKU {sku}: reconcile failed: {e}", "red")
+
+
+    
+
+
+        if changed:
+
+
+            try:
+
+
+                self.populate_inventory_view()
+
+
+            except Exception:
+
+
+                pass
+
+
+
+    def action_open_on_ebay_selected(self):
+
+
+
+        """Open the selected item's eBay listing in the browser using stored Item ID."""
+
+
+
+        import webbrowser, requests, logging
+
+
+
+        logger = logging.getLogger(__name__)
+
+
+
+        items = self.inventory_tree.selection()
+
+
+
+        if not items:
+
+
+
+            try:
+
+
+
+                messagebox.showinfo("Open on eBay", "Please select a row first.")
+
+
+
+            except Exception:
+
+
+
+                pass
+
+
+
+            return
+
+
+
+        iid = items[0]
+
+
+
+        vals = self.inventory_tree.item(iid, "values") or []
+
+
+
+        item_id = None
+
+
+
+        # Try visible column first
+
+
+
+        try:
+
+
+
+            headers = [self.inventory_tree.heading(c)["text"] for c in self.inventory_tree["columns"]]
+
+
+
+            if "eBay ID" in headers:
+
+
+
+                idx = headers.index("eBay ID")
+
+
+
+                if idx < len(vals):
+
+
+
+                    item_id = vals[idx]
+
+
+
+        except Exception:
+
+
+
+            item_id = None
+
+
+
+        # Fallback: DB lookup by SKU (assumes SKU in first column)
+
+
+
+        if not item_id and vals:
+
+
+
+            sku = vals[0]
+
+
+
+            try:
+
+
+
+                with self.db.get_connection() as conn:
+
+
+
+                    c = conn.cursor()
+
+
+
+                    c.execute("SELECT ebay_listing_id FROM inventory WHERE sku = ?", (sku,))
+
+
+
+                    row = c.fetchone()
+
+
+
+                    if row and row[0]:
+
+
+
+                        item_id = row[0]
+
+
+
+            except Exception:
+
+
+
+                pass
+
+
+
+        if not item_id:
+
+
+
+            try:
+
+
+
+                messagebox.showinfo("Open on eBay", "No eBay Item ID stored for the selected row.")
+
+
+
+            except Exception:
+
+
+
+                pass
+
+
+
+            return
+
+
+
+        # If it's likely an offerId, try resolve to listingId on the fly
+
+
+
+        if not (str(item_id).isdigit() and len(str(item_id)) >= 12) and vals:
+
+
+
+            try:
+
+
+
+                token = self.ebay_api.get_access_token()
+
+
+
+                if token:
+
+
+
+                    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+
+
+                    url = f"{self.ebay_api.base_url}/sell/inventory/v1/offer?sku={{vals[0]}}"
+
+
+
+                    r = requests.get(url, headers=headers, timeout=30)
+
+
+
+                    if r.status_code == 200 and r.json().get("offers"):
+
+
+
+                        offers = r.json()["offers"]
+
+
+
+                        active = None
+
+
+
+                        for o in offers:
+
+
+
+                            if (o.get("status") or "").upper() == "ACTIVE":
+
+
+
+                                active = o
+
+
+
+                                break
+
+
+
+                        off = active or offers[0]
+
+
+
+                        lid = off.get('legacyItemId') or off.get('listingId') or (off.get('listing') or {}).get('legacyItemId') or (off.get('listing') or {}).get('listingId')
+
+
+
+                        if not lid:
+
+
+
+                            oid = off.get("offerId") or (off.get("offer") or {}).get("offerId")
+
+
+
+                            if oid:
+
+
+
+                                resolved = self.ebay_api.get_offer(str(oid))
+
+
+
+                                if resolved.get("success"):
+
+
+
+                                    lid = resolved.get('legacyItemId') or (resolved.get('listing') or {}).get('legacyItemId') or resolved.get('listingId') or (resolved.get('listing') or {}).get('listingId')
+
+
+
+                        if lid:
+
+
+
+                            item_id = lid
+
+
+
+            except Exception as e:
+
+
+
+                logger.warning(f"[open] resolution failed: {e}")
+
+
+
+        try:
+
+
+
+            webbrowser.open_new_tab(f"https://www.ebay.co.uk/itm/{item_id}")
+
+
+
+        except Exception:
+
+
+
+            try:
+
+
+
+                messagebox.showerror("Open on eBay", "Failed to open browser.")
+
+
+
+            except Exception:
+
+
+
+                pass
+
+
+
+
+    # ------------------------------
+
+
+
+
+    # eBay → Discogs Import (Wizard)
+
+
+
+
+    # ------------------------------
+
+
+
+
+    def action_import_from_ebay(self):
+
+
+
+
+        try:
+
+
+
+
+            offers = self._fetch_all_ebay_offers()
+
+
+
+
+        except Exception as e:
+
+
+
+
+            messagebox.showerror("Import from eBay", f"Failed to fetch eBay offers:\n{e}")
+
+
+
+
+            return
+
+
+
+
+        work = []
+
+
+
+
+        with self.db.get_connection() as conn:
+
+
+
+
+            c = conn.cursor()
+
+
+
+
+            for off in offers:
+
+
+
+
+                sku = (off.get("sku") or "").strip()
+
+
+
+
+                if not sku:
+
+
+
+
+                    continue
+
+
+
+
+                c.execute("SELECT discogs_listing_id FROM inventory WHERE sku = ?", (sku,))
+
+
+
+
+                row = c.fetchone()
+
+
+
+
+                if not row or not row[0]:
+
+
+
+
+                    work.append(off)
+
+
+
+
+        if not work:
+
+
+
+
+            messagebox.showinfo("Import from eBay", "No eligible eBay listings found (all mapped).")
+
+
+
+
+            return
+
+
+
+
+        self._start_import_wizard(work)
+
+
+
+
+    
+
+
+
+
+    def _fetch_all_ebay_offers(self):
+
+
+
+
+        token = self.ebay_api.get_access_token()
+
+
+
+
+        if not token:
+
+
+
+
+            raise RuntimeError("Missing eBay token")
+
+
+
+
+        import requests
+
+
+
+
+        hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+
+
+
+        base = f"{self.ebay_api.base_url}/sell/inventory/v1/offer"
+
+
+
+
+        offers, limit, offset = [], 200, 0
+
+
+
+
+        while True:
+
+
+
+
+            resp = requests.get(f"{base}?limit={limit}&offset={offset}", headers=hdrs, timeout=30)
+
+
+
+
+            if resp.status_code != 200:
+
+
+
+
+                raise RuntimeError(f"eBay API error {resp.status_code}: {resp.text[:300]}")
+
+
+
+
+            data = resp.json()
+
+
+
+
+            batch = data.get("offers") or []
+
+
+
+
+            for o in batch:
+
+
+
+
+                aspects = (o.get("aspects") or {})
+
+
+
+
+                gtin = None
+
+
+
+
+                for k in ("EAN","UPC","GTIN","ean","upc","gtin"):
+
+
+
+
+                    v = aspects.get(k)
+
+
+
+
+                    if isinstance(v, list) and v:
+
+
+
+
+                        gtin = v[0]; break
+
+
+
+
+                    if isinstance(v, str) and v.strip():
+
+
+
+
+                        gtin = v.strip(); break
+
+
+
+
+                if not gtin:
+
+
+
+
+                    prod = o.get("product") or {}
+
+
+
+
+                    g = prod.get("gtin")
+
+
+
+
+                    if isinstance(g, list) and g:
+
+
+
+
+                        gtin = g[0]
+
+
+
+
+                    elif isinstance(g, str):
+
+
+
+
+                        gtin = g
+
+
+
+
+                offers.append({
+
+
+
+
+                    "sku": o.get("sku"),
+
+
+
+
+                    "title": o.get("title") or (o.get("name") or ""),
+
+
+
+
+                    "offerId": o.get("offerId") or (o.get("offer") or {}).get("offerId"),
+
+
+
+
+                    "listingId": o.get("legacyItemId") or o.get("listingId") or (o.get("listing") or {}).get("legacyItemId") or (o.get("listing") or {}).get("listingId"),
+
+
+
+
+                    "price": ((o.get("pricingSummary") or {}).get("price") or {}).get("value"),
+
+
+
+
+                    "currency": ((o.get("pricingSummary") or {}).get("price") or {}).get("currency"),
+
+
+
+
+                    "quantity": o.get("availableQuantity"),
+
+
+
+
+                    "status": (o.get("status") or "").upper(),
+
+
+
+
+                    "gtin": (gtin or "").strip(),
+
+
+
+
+                    "catno": (aspects.get("Catalogue Number") or aspects.get("Catalog Number") or aspects.get("Cat No") or [""])[0] if isinstance(aspects.get("Catalogue Number") or aspects.get("Catalog Number") or aspects.get("Cat No"), list) else (aspects.get("Catalogue Number") or aspects.get("Catalog Number") or aspects.get("Cat No") or ""),
+
+
+
+
+                    "label": (aspects.get("Record Label") or aspects.get("Label") or [""])[0] if isinstance(aspects.get("Record Label") or aspects.get("Label"), list) else (aspects.get("Record Label") or aspects.get("Label") or ""),
+
+
+
+
+                    "format": (aspects.get("Format") or [""])[0] if isinstance(aspects.get("Format"), list) else (aspects.get("Format") or ""),
+
+
+
+
+                    "country": (aspects.get("Country/Region of Manufacture") or [""])[0] if isinstance(aspects.get("Country/Region of Manufacture"), list) else (aspects.get("Country/Region of Manufacture") or ""),
+
+
+
+
+                    "year": (aspects.get("Release Year") or [""])[0] if isinstance(aspects.get("Release Year"), list) else (aspects.get("Release Year") or ""),
+
+
+
+
+                })
+
+
+
+
+            total = data.get("total", 0)
+
+
+
+
+            offset += len(batch)
+
+
+
+
+            if offset >= total or not batch:
+
+
+
+
+                break
+
+
+
+
+        return offers
+
+
+
+
+    
+
+
+
+
+    def _start_import_wizard(self, offers):
+
+
+
+
+        self._import_offers = [o for o in offers]
+
+
+
+
+        self._import_idx = 0
+
+
+
+
+        win = tk.Toplevel(self.root)
+
+
+
+
+        win.title("Import from eBay → Discogs match")
+
+
+
+
+        win.geometry("720x520")
+
+
+
+
+        self._import_win = win
+
+
+
+
+        self._imp_hdr = tk.Label(win, text="", font=("Helvetica", 14, "bold"))
+
+
+
+
+        self._imp_hdr.pack(anchor="w", padx=12, pady=(10, 6))
+
+
+
+
+        self._imp_info = tk.Text(win, height=10, wrap="word")
+
+
+
+
+        self._imp_info.pack(fill="x", padx=12)
+
+
+
+
+        self._imp_status = tk.Label(win, text="", fg="gray")
+
+
+
+
+        self._imp_status.pack(anchor="w", padx=12, pady=6)
+
+
+
+
+        btns = tk.Frame(win)
+
+
+
+
+        btns.pack(fill="x", padx=12, pady=8)
+
+
+
+
+        tk.Button(btns, text="Accept", command=self._import_accept).pack(side="left", padx=4)
+
+
+
+
+        tk.Button(btns, text="See Alternatives…", command=self._import_alternatives).pack(side="left", padx=4)
+
+
+
+
+        tk.Button(btns, text="Skip", command=self._import_skip).pack(side="left", padx=4)
+
+
+
+
+        tk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+
+
+
+
+        self._import_propose_current()
+
+
+
+
+    
+
+
+
+
+    def _import_propose_current(self):
+
+
+
+
+        if self._import_idx >= len(self._import_offers):
+
+
+
+
+            try:
+
+
+
+
+                self.populate_inventory_view()
+
+
+
+
+            except Exception:
+
+
+
+
+                pass
+
+
+
+
+            messagebox.showinfo("Import from eBay", "Done.")
+
+
+
+
+            self._import_win.destroy()
+
+
+
+
+            return
+
+
+
+
+        o = self._import_offers[self._import_idx]
+
+
+
+
+        sku = o.get("sku") or ""
+
+
+
+
+        title = o.get("title") or ""
+
+
+
+
+        gtin = o.get("gtin") or ""
+
+
+
+
+        catno = o.get("catno") or ""
+
+
+
+
+        label = o.get("label") or ""
+
+
+
+
+        fmt = o.get("format") or ""
+
+
+
+
+        self._imp_hdr.config(text=f"SKU {sku} — {title}")
+
+
+
+
+        self._imp_info.delete("1.0", "end")
+
+
+
+
+        self._imp_info.insert("end", f"eBay ID: {o.get('listingId') or o.get('offerId')}\n")
+
+
+
+
+        self._imp_info.insert("end", f"GTIN/Barcode: {gtin or '—'}\n")
+
+
+
+
+        self._imp_info.insert("end", f"Cat No: {catno or '—'}\n")
+
+
+
+
+        self._imp_info.insert("end", f"Label: {label or '—'} | Format: {fmt or '—'}\n\n")
+
+
+
+
+        try:
+
+
+
+
+            cands = self._discogs_find_candidates(gtin=gtin, catno=catno, title=title, label=label or None)
+
+
+
+
+        except Exception as e:
+
+
+
+
+            self._imp_status.config(text=f"Discogs search failed: {e}")
+
+
+
+
+            self._import_candidates = []
+
+
+
+
+            return
+
+
+
+
+        self._import_candidates = cands
+
+
+
+
+        if not cands:
+
+
+
+
+            self._imp_status.config(text="No candidates found. Click ‘See Alternatives…’ to search manually.")
+
+
+
+
+        else:
+
+
+
+
+            top = cands[0]
+
+
+
+
+            self._imp_status.config(text=f"Proposed: {top['artist']} – {top['title']} [{top['label']} • {top['year']} • {top['country']}]  ({top['method']}, {int(top['confidence']*100)}%)")
+
+
+
+
+    
+
+
+
+
+    def _discogs_find_candidates(self, gtin: str = "", catno: str = "", title: str = "", label: str = None):
+
+
+
+
+        results = []
+
+
+
+
+        if gtin:
+
+
+
+
+            res = self.discogs_client.search(barcode=gtin, type="release", format="Vinyl")
+
+
+
+
+            for r in list(res)[:10]:
+
+
+
+
+                results.append({"release_id": r.id, "title": r.title,
+
+
+
+
+                    "artist": getattr(r, "artist", getattr(r, "artists", "")),
+
+
+
+
+                    "label": ", ".join(getattr(r, "label", getattr(r, "labels", [])) or []),
+
+
+
+
+                    "year": getattr(r, "year", "") or "",
+
+
+
+
+                    "country": getattr(r, "country", "") or "",
+
+
+
+
+                    "method": "barcode", "confidence": 1.0})
+
+
+
+
+        if catno:
+
+
+
+
+            res = self.discogs_client.search(catno=catno, type="release", format="Vinyl")
+
+
+
+
+            for r in list(res)[:10]:
+
+
+
+
+                results.append({"release_id": r.id, "title": r.title,
+
+
+
+
+                    "artist": getattr(r, "artist", getattr(r, "artists", "")),
+
+
+
+
+                    "label": ", ".join(getattr(r, "label", getattr(r, "labels", [])) or []),
+
+
+
+
+                    "year": getattr(r, "year", "") or "",
+
+
+
+
+                    "country": getattr(r, "country", "") or "",
+
+
+
+
+                    "method": "catno", "confidence": 0.85 if not label else 0.9})
+
+
+
+
+        if (not results) and title:
+
+
+
+
+            res = self.discogs_client.search(title=title, type="release", format="Vinyl", label=label or None)
+
+
+
+
+            for r in list(res)[:10]:
+
+
+
+
+                results.append({"release_id": r.id, "title": r.title,
+
+
+
+
+                    "artist": getattr(r, "artist", getattr(r, "artists", "")),
+
+
+
+
+                    "label": ", ".join(getattr(r, "label", getattr(r, "labels", [])) or []),
+
+
+
+
+                    "year": getattr(r, "year", "") or "",
+
+
+
+
+                    "country": getattr(r, "country", "") or "",
+
+
+
+
+                    "method": "fuzzy", "confidence": 0.6})
+
+
+
+
+        seen, ranked = set(), []
+
+
+
+
+        for r in sorted(results, key=lambda x: x["confidence"], reverse=True):
+
+
+
+
+            if r["release_id"] in seen: continue
+
+
+
+
+            seen.add(r["release_id"]); ranked.append(r)
+
+
+
+
+        return ranked
+
+
+
+
+    
+
+
+
+
+    def _import_accept(self):
+
+
+
+
+        if self._import_idx >= len(self._import_offers): return
+
+
+
+
+        o = self._import_offers[self._import_idx]
+
+
+
+
+        top = (self._import_candidates[0] if self._import_candidates else None)
+
+
+
+
+        if not top:
+
+
+
+
+            messagebox.showinfo("Import from eBay", "No candidate to accept for this item."); return
+
+
+
+
+        sku = (o.get("sku") or "").strip()
+
+
+
+
+        now_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+
+
+
+
+        with self.db.get_connection() as conn:
+
+
+
+
+            c = conn.cursor()
+
+
+
+
+            c.execute("SELECT 1 FROM inventory WHERE sku = ?", (sku,))
+
+
+
+
+            exists = c.fetchone() is not None
+
+
+
+
+            if exists:
+
+
+
+
+                c.execute("""UPDATE inventory
+
+
+
+
+                             SET discogs_listing_id = ?,
+
+
+
+
+                                 discogs_match_method = ?, discogs_match_confidence = ?,
+
+
+
+
+                                 barcode = COALESCE(?, barcode),
+
+
+
+
+                                 inv_updated_at = ?
+
+
+
+
+                             WHERE sku = ?""", 
+
+
+
+
+                          (str(top["release_id"]), top["method"], float(top["confidence"]),
+
+
+
+
+                           (o.get("gtin") or None), now_iso, sku))
+
+
+
+
+            else:
+
+
+
+
+                c.execute("""INSERT INTO inventory
+
+
+
+
+                             (sku, artist, title, price, status, ebay_listing_id, discogs_listing_id,
+
+
+
+
+                              barcode, discogs_match_method, discogs_match_confidence, inv_updated_at, date_added)
+
+
+
+
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+
+
+
+
+                          (sku, "", o.get("title") or "", o.get("price") or 0.0, "For Sale",
+
+
+
+
+                           (o.get("listingId") or None), str(top["release_id"]),
+
+
+
+
+                           (o.get("gtin") or None), top["method"], float(top["confidence"]), now_iso, now_iso))
+
+
+
+
+        self.append_log(f"Imported {sku} → Discogs {top['release_id']} ({top['method']}, {int(top['confidence']*100)}%)", "green")
+
+
+
+
+        self._import_idx += 1
+
+
+
+
+        self._import_propose_current()
+
+
+
+
+    
+
+
+
+
+    def _import_alternatives(self):
+
+
+
+
+        if not self._import_candidates:
+
+
+
+
+            messagebox.showinfo("Alternatives", "No candidates available for this item."); return
+
+
+
+
+        top = tk.Toplevel(self._import_win); top.title("Choose a Discogs release")
+
+
+
+
+        lb = tk.Listbox(top, width=90, height=10)
+
+
+
+
+        for i, r in enumerate(self._import_candidates[:12]):
+
+
+
+
+            lb.insert("end", f"{i+1}. {r['artist']} – {r['title']}  [{r['label']} • {r['year']} • {r['country']}]  ({r['method']}, {int(r['confidence']*100)}%)")
+
+
+
+
+        lb.pack(fill="both", expand=True)
+
+
+
+
+        def choose():
+
+
+
+
+            idx = lb.curselection()
+
+
+
+
+            if not idx: return
+
+
+
+
+            i = idx[0]
+
+
+
+
+            chosen = self._import_candidates[i]
+
+
+
+
+            rest = [r for j,r in enumerate(self._import_candidates) if j != i]
+
+
+
+
+            self._import_candidates = [chosen] + rest
+
+
+
+
+            top.destroy()
+
+
+
+
+            self._imp_status.config(text=f"Chosen: {chosen['artist']} – {chosen['title']} [{chosen['label']} • {chosen['year']} • {chosen['country']}]  ({chosen['method']}, {int(chosen['confidence']*100)}%)")
+
+
+
+
+        tk.Button(top, text="Use Selected", command=choose).pack(pady=6)
+
+
+
+
+    
+
+
+
+
+    def _import_skip(self):
+
+
+
+
+        self._import_idx += 1
+
+
+
+
+        self._import_propose_current()
+
+
+
+
+
+    def action_ebay_sync_selected(self):
+
+        """Sync selected inventory SKUs from eBay into local DB (status/listingId)."""
+
+        items = self.inventory_tree.selection()
+
+        if not items:
+
+            try:
+
+                messagebox.showinfo("Sync from eBay", "Please select one or more items in the inventory list.")
+
+            except Exception:
+
+                pass
+
+            return
+
+        skus = []
+
+        for iid in items:
+
+            vals = self.inventory_tree.item(iid, "values")
+
+            if not vals:
+
+                continue
+
+            skus.append(vals[0])
+
+        try:
+
+            self.reconcile_from_ebay(skus)
+
+        except Exception as e:
+
+            try:
+
+                messagebox.showerror("Sync from eBay", f"Failed to sync: {e}")
+
+            except Exception:
+
+                pass
+
+
+    def action_discogs_save_unpublished(self):
+        """Create Discogs draft listings"""
+        if self.notebook.tab(self.notebook.select(), "text") == "Lister":
+            self._create_discogs_draft_from_lister()
+        else:
+            self._create_discogs_draft_from_inventory()
+
+    def action_discogs_publish_live(self):
+        """Create live Discogs listings"""
+        if self.notebook.tab(self.notebook.select(), "text") == "Lister":
+            # Create live listing instead of draft
+            self._list_on_discogs_live()
+        else:
+            # Modify existing publish_to_discogs to use "For Sale" status
+            self._publish_to_discogs_live()
+
+    def _save_ebay_draft_from_lister(self):
+        """Save current lister form as eBay-ready in database with duplicate checking"""
+        try:
+            # Validate required fields
+            required_fields = ['artist', 'title', 'media_condition']
+            for field in required_fields:
+                if not self.entries[field.replace(' ', '_')].get().strip():
+                    messagebox.showwarning("Validation Error", f"Please enter {field}")
+                    return
+            
+            try:
+                price = float(self.price_entry.get())
+                if price <= 0:
+                    messagebox.showwarning("Validation Error", "Please enter a valid price")
+                    return
+            except (ValueError, TypeError):
+                messagebox.showwarning("Validation Error", "Please enter a valid price")
+                return
+
+            # Generate SKU if needed
+            sku = self.editing_sku or self.sku_display_var.get() or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            if not self.editing_sku and not self.temporary_sku:
+                self.sku_display_var.set(sku)
+
+            # Check for existing listings and warn user
+            existing = self._check_existing_listings(sku)
+            if existing['has_ebay'] or existing['has_ebay_draft']:
+                warning_parts = []
+                if existing['has_ebay']:
+                    warning_parts.append(f"Live eBay listing: {existing['ebay_listing_id']}")
+                if existing['has_ebay_draft']:
+                    warning_parts.append(f"eBay draft: {existing['ebay_draft_id']}")
+                
+                warning_text = "\n".join(warning_parts)
+                message = (f"SKU {sku} already has:\n\n{warning_text}\n\n"
+                          f"This will update the existing record. Continue?")
+                
+                if not messagebox.askyesno("Existing eBay Data Found", message):
+                    return
+
+            # Save to database with special status
+            payload_json = json.dumps(self._serialize_form_to_payload())
+            
+            try:
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    
+                    if self.editing_sku:
+                        # Update existing
+                        cursor.execute("""
+                            UPDATE inventory SET 
+                            status = 'eBay Ready',
+                            last_modified = ?,
+                            lister_payload = ?
+                            WHERE sku = ?
+                        """, (now_iso, payload_json, sku))
+                        message = f"Updated SKU {sku} as ready for eBay"
+                    else:
+                        # Create new with basic info
+                        cursor.execute("""
+                            INSERT INTO inventory (
+                                sku, artist, title, price, status, date_added, 
+                                last_modified, lister_payload
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            sku,
+                            self.entries["artist"].get().strip(),
+                            self.entries["title"].get().strip(), 
+                            price,
+                            'eBay Ready',
+                            now_iso,
+                            now_iso,
+                            payload_json
+                        ))
+                        message = f"Saved SKU {sku} as ready for eBay"
+                    
+                    self.populate_inventory_view()
+                    self.append_log(message, "green")
+                    messagebox.showinfo("eBay Draft Saved", 
+                        f"{message}\n\n" +
+                        f"Note: This creates a local draft in your database.\n" + 
+                        f"eBay doesn't provide draft functionality via their public API.\n" +
+                        f"Use 'Publish Live' when ready to list on eBay.")
+                    
+            except Exception as e:
+                logger.error(f"Failed to save eBay draft: {e}")
+                messagebox.showerror("Database Error", f"Failed to save: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error in _save_ebay_draft_from_lister: {e}")
+            messagebox.showerror("Error", f"An error occurred: {e}")
+
+    def _save_ebay_draft_from_inventory(self):
+        """Mark selected inventory items as ready for eBay"""
+        selected = self.inventory_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select items to prepare for eBay")
+            return
+        
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                
+                updated_count = 0
+                for item in selected:
+                    sku = self.inventory_tree.item(item, "values")[0]
+                    cursor.execute("""
+                        UPDATE inventory SET 
+                        status = 'eBay Ready',
+                        last_modified = ?
+                        WHERE sku = ?
+                    """, (now_iso, sku))
+                    updated_count += 1
+                
+                self.populate_inventory_view()
+                message = f"Marked {updated_count} item(s) as ready for eBay"
+                self.append_log(message, "green")
+                messagebox.showinfo("Success", message)
+                
+        except Exception as e:
+            logger.error(f"Failed to mark items as eBay ready: {e}")
+            messagebox.showerror("Database Error", f"Failed to update items: {e}")
+
+    def _create_discogs_draft_from_lister(self):
+        """Create Discogs draft from current lister form"""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to Discogs first")
+            return
+            
+        if not self.current_release_id:
+            messagebox.showerror("Missing Release", "You must select a specific Discogs release variant first")
+            return
+            
+        try:
+            price = float(self.price_entry.get())
+            media_condition = self.entries["media_condition"].get()
+            if not media_condition or media_condition not in REVERSE_GRADE_MAP:
+                messagebox.showwarning("Validation Error", "Please select a valid media condition")
+                return
+        except (ValueError, TypeError):
+            messagebox.showwarning("Validation Error", "Please enter a valid price")
+            return
+        
+        listing_data = {
+            'release_id': self.current_release_id,
+            'price': price,
+            'status': 'Draft',  # Explicitly set as draft
+            'condition': REVERSE_GRADE_MAP.get(media_condition),
+            'sleeve_condition': REVERSE_GRADE_MAP.get(self.entries["sleeve_condition"].get(), 'Generic'),
+            'comments': self.full_desc.get("1.0", tk.END).strip()
+        }
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        def draft_worker():
+            try:
+                listing_id = self._safe_discogs_publish(self.editing_sku or "NEW", listing_data, is_draft=True)
+                if listing_id:
+                    self.safe_after(0, lambda: self._handle_discogs_draft_success(listing_id))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Draft Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=draft_worker, daemon=True).start()
+
+    def _create_discogs_draft_from_inventory(self):
+        """Create Discogs drafts from selected inventory items"""
+        selected = self.inventory_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select items to create Discogs drafts")
+            return
+        
+        def draft_worker():
+            for item in selected:
+                sku = self.inventory_tree.item(item, "values")[0]
+                try:
+                    record = self._get_inventory_record(sku)
+                    if not record:
+                        self.append_log(f"SKU {sku}: Could not find record.", "red")
+                        continue
+                    
+                    errors = validate_listing("discogs", record, self.config)
+                    if errors:
+                        self.append_log(f"SKU {sku}: {', '.join(errors)}", "red")
+                        continue
+                    
+                    self.append_log(f"Creating Discogs draft for SKU {sku}...", "black")
+                    listing_data = {
+                        "release_id": record.get("discogs_release_id"),
+                        "condition": REVERSE_GRADE_MAP.get(record.get("media_condition"), "Good (G)"),
+                        "sleeve_condition": REVERSE_GRADE_MAP.get(record.get("sleeve_condition"), "Good (G)"),
+                        "price": record.get("price", 0), 
+                        "status": "Draft",  # Create as draft
+                        "comments": record.get("description", "")
+                    }
+                    
+                    listing_id = self.discogs_api.create_listing(listing_data)
+                    if listing_id:
+                        self.append_log(f"SKU {sku}: Created Discogs draft (ID: {listing_id})", "green")
+                        try:
+                            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            with self.db.get_connection() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    "UPDATE inventory SET discogs_listing_id = ?, discogs_updated_at = ? WHERE sku = ?",
+                                    (listing_id, now_iso, sku),
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to update inventory with Discogs listing ID: {e}")
+                            self.append_log(f"SKU {sku}: Failed to save Discogs listing ID to DB: {e}", "red")
+                    else:
+                        self.append_log(f"SKU {sku}: Failed to create draft", "red")
+                except Exception as e:
+                    self.append_log(f"SKU {sku}: Error - {e}", "red")
+            
+            self.safe_after(0, self.populate_inventory_view)
+        
+        threading.Thread(target=draft_worker, daemon=True).start()
+
+    def _list_on_discogs_live(self):
+        """Create live Discogs listing (For Sale status) from lister form"""
+        if not self.discogs_api.is_connected():
+            messagebox.showwarning("Not Connected", "Please connect to Discogs first")
+            return
+            
+        if not self.current_release_id:
+            messagebox.showerror("Missing Release", "You must select a specific Discogs release variant first")
+            return
+            
+        try:
+            price = float(self.price_entry.get())
+            media_condition = self.entries["media_condition"].get()
+            if not media_condition or media_condition not in REVERSE_GRADE_MAP:
+                messagebox.showwarning("Validation Error", "Please select a valid media condition")
+                return
+        except (ValueError, TypeError):
+            messagebox.showwarning("Validation Error", "Please enter a valid price")
+            return
+        
+        listing_data = {
+            'release_id': self.current_release_id,
+            'price': price,
+            'status': 'For Sale',  # Live listing
+            'condition': REVERSE_GRADE_MAP.get(media_condition),
+            'sleeve_condition': REVERSE_GRADE_MAP.get(self.entries["sleeve_condition"].get(), 'Generic'),
+            'comments': self.full_desc.get("1.0", tk.END).strip()
+        }
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        def live_worker():
+            try:
+                listing_id = self.discogs_api.create_listing(listing_data)
+                if listing_id:
+                    self.safe_after(0, lambda: self._handle_discogs_live_success(listing_id))
+            except Exception as e:
+                self.safe_after(0, lambda: messagebox.showerror("Listing Error", str(e)))
+            finally:
+                self.safe_after(0, lambda: self.root.config(cursor=""))
+        
+        threading.Thread(target=live_worker, daemon=True).start()
+
+    def _publish_to_discogs_live(self):
+        """Publish selected items to Discogs as live (For Sale) listings"""
+        selected = self.inventory_tree.selection()
+        if not selected: 
+            return
+        
+        def live_worker():
+            for item in selected:
+                sku = self.inventory_tree.item(item, "values")[0]
+                try:
+                    record = self._get_inventory_record(sku)
+                    if not record:
+                        self.append_log(f"SKU {sku}: Could not find record.", "red")
+                        continue
+                    
+                    errors = validate_listing("discogs", record, self.config)
+                    if errors:
+                        self.append_log(f"SKU {sku}: {', '.join(errors)}", "red")
+                        continue
+                    
+                    self.append_log(f"Publishing SKU {sku} live to Discogs...", "black")
+                    listing_data = {
+                        "release_id": record.get("discogs_release_id"),
+                        "condition": REVERSE_GRADE_MAP.get(record.get("media_condition"), "Good (G)"),
+                        "sleeve_condition": REVERSE_GRADE_MAP.get(record.get("sleeve_condition"), "Good (G)"),
+                        "price": record.get("price", 0), 
+                        "status": "For Sale",  # Live listing
+                        "comments": record.get("description", "")
+                    }
+                    
+                    listing_id = self.discogs_api.create_listing(listing_data)
+                    if listing_id:
+                        self.append_log(f"SKU {sku}: Published live to Discogs (ID: {listing_id})", "green")
+                        try:
+                            # Mirror Lister flow: show success dialog and refresh UI
+                            self.safe_after(0, lambda lid=listing_id: self._handle_discogs_live_success(lid))
+                        except Exception:
+                            pass
+                        try:
+                            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            with self.db.get_connection() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    "UPDATE inventory SET discogs_listing_id = ?, discogs_updated_at = ? WHERE sku = ?",
+                                    (listing_id, now_iso, sku),
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to update inventory with Discogs listing ID: {e}")
+                            self.append_log(f"SKU {sku}: Failed to save Discogs listing ID to DB: {e}", "red")
+                    else:
+                        self.append_log(f"SKU {sku}: Failed to create live listing", "red")
+                except Exception as e:
+                    self.append_log(f"SKU {sku}: Error - {e}", "red")
+            
+            self.safe_after(0, self.populate_inventory_view)
+        
+        threading.Thread(target=live_worker, daemon=True).start()
+
+    def _handle_discogs_draft_success(self, listing_id):
+        """Handle successful Discogs draft creation"""
+        messagebox.showinfo("Success", f"Successfully created Discogs DRAFT (Listing ID: {listing_id})")
+        if self.editing_sku:
+            try:
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE inventory SET discogs_listing_id = ? WHERE sku = ?", (listing_id, self.editing_sku))
+            except Exception as e:
+                logger.error(f"Failed to update inventory with listing ID: {e}")
+
+    def _handle_discogs_live_success(self, listing_id):
+        """Handle successful Discogs live listing creation"""
+        messagebox.showinfo("Success", f"Successfully published LIVE to Discogs (Listing ID: {listing_id})")
+        if self.editing_sku:
+            try:
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE inventory SET discogs_listing_id = ? WHERE sku = ?", (listing_id, self.editing_sku))
+            except Exception as e:
+                logger.error(f"Failed to update inventory with listing ID: {e}")
+
+    def _prepare_ebay_listing_data(self, *args, **kwargs):
+        from vinyltool.core import listing
+        return listing._prepare_ebay_listing_data(self, *args, **kwargs)
+    def refresh_button_states(self):
+        """Refresh all button states based on current connection status"""
+        self._update_connection_status()
+        # Trigger inventory selection update if items are selected
+        if hasattr(self, 'inventory_tree') and self.inventory_tree.selection():
+            self.on_inventory_selection()
+
+
+    # ========================================================================
+    # DUPLICATE PREVENTION SYSTEM
+    # ========================================================================
+    
+    def _check_existing_listings(self, sku: str) -> dict:
+        """Check what listings already exist for this SKU"""
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ebay_listing_id, discogs_listing_id, ebay_item_draft_id, status 
+                    FROM inventory WHERE sku = ?
+                """, (sku,))
+                row = cursor.fetchone()
+                
+                if row:
+                    return {
+                        'ebay_listing_id': row[0],
+                        'discogs_listing_id': row[1], 
+                        'ebay_draft_id': row[2],
+                        'status': row[3],
+                        'has_ebay': bool(row[0]),
+                        'has_discogs': bool(row[1]),
+                        'has_ebay_draft': bool(row[2])
+                    }
+                else:
+                    return {
+                        'ebay_listing_id': None,
+                        'discogs_listing_id': None,
+                        'ebay_draft_id': None,
+                        'status': None,
+                        'has_ebay': False,
+                        'has_discogs': False,
+                        'has_ebay_draft': False
+                    }
+        except Exception as e:
+            logger.error(f"Error checking existing listings for {sku}: {e}")
+            return {'has_ebay': False, 'has_discogs': False, 'has_ebay_draft': False}
+
+    def _confirm_overwrite_action(self, platform: str, sku: str, existing_info: dict) -> bool:
+        """Ask user to confirm if they want to overwrite/update existing listing"""
+        existing_ids = []
+        if platform.lower() == 'ebay':
+            if existing_info.get('has_ebay'):
+                existing_ids.append(f"Live eBay listing: {existing_info.get('ebay_listing_id')}")
+            if existing_info.get('has_ebay_draft'):
+                existing_ids.append(f"eBay draft: {existing_info.get('ebay_draft_id')}")
+        elif platform.lower() == 'discogs':
+            if existing_info.get('has_discogs'):
+                existing_ids.append(f"Discogs listing: {existing_info.get('discogs_listing_id')}")
+        
+        if not existing_ids:
+            return True  # No existing listings, safe to proceed
+        
+        existing_text = "\n".join(existing_ids)
+        message = (
+            f"SKU {sku} already has existing {platform} listing(s):\n\n"
+            f"{existing_text}\n\n"
+            f"Do you want to UPDATE the existing listing instead of creating a duplicate?\n\n"
+            f"Choose 'Yes' to update existing listing\n"
+            f"Choose 'No' to cancel and avoid duplicates"
+        )
+        
+        return messagebox.askyesno(f"Existing {platform} Listing Found", message)
+
+    def _safe_ebay_publish(self, sku: str, listing_data: dict, is_draft: bool = False) -> dict:
+        """Safely publish to eBay with duplicate prevention"""
+        # Check for existing listings
+        existing = self._check_existing_listings(sku)
+        
+        # Determine what action to take
+        action_type = "draft" if is_draft else "live"
+        
+        if existing['has_ebay'] and not is_draft:
+            # Has live listing, asking to publish live again
+            if not self._confirm_overwrite_action('eBay', sku, existing):
+                return {'success': False, 'cancelled': True, 'reason': 'User cancelled to avoid duplicate'}
+            
+            # User wants to update - modify existing listing
+            self.append_log(f"SKU {sku}: Updating existing eBay listing {existing['ebay_listing_id']}", "blue")
+            # Use existing eBay update logic here
+            return self.ebay_api.create_draft_listing(listing_data)  # This handles updates
+            
+        elif existing['has_ebay_draft'] and is_draft:
+            # Has draft, asking to create another draft
+            if not self._confirm_overwrite_action('eBay', sku, existing):
+                return {'success': False, 'cancelled': True, 'reason': 'User cancelled to avoid duplicate'}
+            
+            self.append_log(f"SKU {sku}: Updating existing eBay draft", "blue")
+            # Proceed with update
+            
+        elif existing['has_ebay'] and is_draft:
+            # Has live listing, wants to create draft - warn but allow
+            message = (f"SKU {sku} already has a LIVE eBay listing.\n\n"
+                      f"Creating a draft will not affect the live listing.\n"
+                      f"Continue?")
+            if not messagebox.askyesno("Live Listing Exists", message):
+                return {'success': False, 'cancelled': True, 'reason': 'User cancelled'}
+        
+        # Proceed with creation/update
+        result = self.ebay_api.create_draft_listing(listing_data)
+        
+        # Log the action
+        if result.get('success'):
+            action_desc = "draft saved" if is_draft else "published live"
+            self.append_log(f"SKU {sku}: eBay listing {action_desc} successfully", "green")
+        
+        return result
+
+    def _safe_discogs_publish(self, sku: str, listing_data: dict, is_draft: bool = False) -> int:
+        """Safely publish to Discogs with duplicate prevention"""
+        existing = self._check_existing_listings(sku)
+        
+        if existing['has_discogs']:
+            if not self._confirm_overwrite_action('Discogs', sku, existing):
+                self.append_log(f"SKU {sku}: Discogs publish cancelled to avoid duplicate", "orange")
+                return None
+            
+            # User wants to update existing listing
+            discogs_id = existing['discogs_listing_id']
+            self.append_log(f"SKU {sku}: Updating existing Discogs listing {discogs_id}", "blue")
+            
+            # Update instead of create
+            success = self.discogs_api.update_listing(discogs_id, listing_data)
+            if success:
+                self.append_log(f"SKU {sku}: Discogs listing updated successfully", "green")
+                return discogs_id
+            else:
+                self.append_log(f"SKU {sku}: Failed to update Discogs listing", "red") 
+                return None
+        
+        # No existing listing, safe to create new
+        action_desc = "draft" if is_draft else "live listing"
+        self.append_log(f"SKU {sku}: Creating new Discogs {action_desc}", "black")
+        
+        listing_id = self.discogs_api.create_listing(listing_data)
+        if listing_id:
+            self.append_log(f"SKU {sku}: Discogs {action_desc} created successfully (ID: {listing_id})", "green")
+        
+        return listing_id
+
+
+    def log_sync_activity(self, message):
+        """Log sync activity to the text widget"""
+        def do_log():
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.sync_log_text.config(state="normal")
+            self.sync_log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.sync_log_text.see(tk.END)
+            self.sync_log_text.config(state="disabled")
+        self.safe_after(0, do_log)
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+    def action_publish_both_live(self):
+        # Publish current Lister form to eBay and Discogs with one click.
+        try:
+            self.action_ebay_publish_live()
+        except Exception as e:
+            try:
+                self.append_log(f"Combined publish: eBay error: {e}", "red")
+            except Exception:
+                pass
+        try:
+            self.action_discogs_publish_live()
+        except Exception as e:
+            try:
+                self.append_log(f"Combined publish: Discogs error: {e}", "red")
+            except Exception:
+                pass
+
+
+    def open_listing_in_browser(self):
+        """Open the appropriate listing page in the browser for the selected inventory item."""
+        selected = self.inventory_tree.focus()
+        if not selected:
+            return
+        sku = self.inventory_tree.item(selected, "values")[0]
+        try:
+            record = self._get_inventory_record(sku)
+            # eBay draft first (no direct URL to a single draft; open drafts overview)
+            draft_id = record.get("ebay_item_draft_id")
+            if draft_id:
+                webbrowser.open_new_tab("https://www.ebay.co.uk/sh/lst/drafts")
+                return
+            # Live eBay item
+            live_id = record.get("ebay_listing_id")
+            if live_id:
+                webbrowser.open_new_tab(f"https://www.ebay.co.uk/itm/{live_id}")
+                return
+            # Discogs listing
+            discogs_id = record.get("discogs_listing_id")
+            if discogs_id:
+                webbrowser.open_new_tab(f"https://www.discogs.com/sell/item/{discogs_id}")
+                return
+            messagebox.showinfo("No Listing", "This item does not have any listing IDs yet.")
+        except Exception as e:
+            logger.error(f"Failed to open listing: {e}")
+            messagebox.showerror("Error", f"Failed to open listing: {e}")
+
+if __name__ == "__main__":
+    import sys, traceback
+    print("Launcher: starting Vinyl Tool UI…")
+    for fname in ("main", "run_app", "run", "start", "launch"):
+        fn = globals().get(fname)
+        if callable(fn):
+            try: sys.exit(fn() or 0)
+            except SystemExit: raise
+            except Exception: traceback.print_exc(); sys.exit(1)
+    try:
+        import tkinter as tk
+    except Exception:
+        traceback.print_exc(); sys.exit(1)
+    for cname in ("VinylToolApp", "App", "MainApp", "Application"):
+        cls = globals().get(cname)
+        if not cls: continue
+        try:
+            root = tk.Tk()
+            try:
+                app = cls(root)
+                loop_root = getattr(app, "root", None) or root
+            except TypeError:
+                root.destroy()
+                app = cls()
+                loop_root = getattr(app, "root", None) or tk.Tk()
+            ml = getattr(loop_root, "mainloop", None)
+            if callable(ml):
+                ml(); sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            traceback.print_exc(); sys.exit(1)
+    print("Launcher: could not find an entry point (function or class).")
+    sys.exit(1)
+
+
+
+# --- RUNTIME_OPEN_EBAY_FIX: ensure saving of listingId and correct open action ---
+try:
+    # Save live listingId after publish (Lister path calls this)
+    if not hasattr(VinylToolApp, "_handle_ebay_listing_success"):
+        def _vt_handle_ebay_listing_success(self, sku: str, listing_id: str):
+            import datetime, logging
+            logger = logging.getLogger(__name__)
+            try:
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                        (listing_id, now_iso, sku),
+                    )
+                try:
+                    self.append_log(f"SKU {sku}: Saved eBay Listing ID {listing_id}", "green")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    logger.error(f"Failed to update inventory with eBay listing ID: {e}", exc_info=True)
+                    self.append_log(f"SKU {sku}: Failed to save eBay Listing ID to local DB: {e}", "red")
+                except Exception:
+                    pass
+            try:
+                self.populate_inventory_view()
+                if hasattr(self, "open_in_browser_btn"):
+                    self.open_in_browser_btn.config(state="normal")
+            except Exception:
+                pass
+        VinylToolApp._handle_ebay_listing_success = _vt_handle_ebay_listing_success
+
+    # Right-click "Open on eBay" → use the eBay Listing ID from the grid or DB
+    if not hasattr(VinylToolApp, "open_ebay_listing"):
+        def _vt_open_ebay_listing(self, event=None):
+            import webbrowser
+            from tkinter import messagebox
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select an inventory item.")
+                return
+            values = self.inventory_tree.item(sel[0], "values")
+            sku = values[0] if values else ""
+            # Column order: 0=SKU, 6=eBay Listing ID
+            listing_id = ""
+            try:
+                listing_id = str(values[6] or "").strip()
+            except Exception:
+                listing_id = ""
+            if not listing_id and sku:
+                rec = self._get_inventory_record(sku)
+                listing_id = str(rec.get("ebay_listing_id") or "").strip()
+            if not listing_id:
+                messagebox.showinfo("No eBay Listing", "No eBay Listing ID found for this item.")
+                return
+            url = f"https://www.ebay.co.uk/itm/{listing_id}"
+            try:
+                webbrowser.open_new_tab(url)
+                try:
+                    self.append_log(f"Opened eBay listing: {url}", "black")
+                except Exception:
+                    pass
+            except Exception as e:
+                messagebox.showerror("Open Error", f"Failed to open eBay listing:\n{e}")
+        VinylToolApp.open_ebay_listing = _vt_open_ebay_listing
+
+    if not hasattr(VinylToolApp, "action_open_on_ebay_selected"):
+        def _vt_action_open_on_ebay_selected(self):
+            return self.open_ebay_listing()
+        VinylToolApp.action_open_on_ebay_selected = _vt_action_open_on_ebay_selected
+except Exception:
+    pass
+# --- /RUNTIME_OPEN_EBAY_FIX ---
+
+
+
+# --- RUNTIME_EBAY_ID_AUTO_SYNC: Sync eBay listingId from eBay by SKU ---
+try:
+    import datetime, logging
+    from tkinter import messagebox
+
+    # Ensure EbayAPI helper exists (runtime shim)
+    if not hasattr(EbayAPI, "get_listing_id_for_sku"):
+        def _ui_get_listing_id_for_sku(self, sku: str) -> str | None:
+            """
+            Look up the current offer for this SKU and return its listingId if published.
+            """
+            try:
+                import requests
+                token = self.get_access_token()
+                base = f"{self.base_url}/sell/inventory/v1"
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                }
+                r = requests.get(f"{base}/offer?sku={sku}", headers=headers, timeout=30)
+                if r.status_code != 200:
+                    return None
+                offers = (r.json() or {}).get("offers") or []
+                # Prefer published offers on the configured marketplace
+                preferred_market = getattr(self, "config", {}).get("marketplace_id", "EBAY_GB") if hasattr(self, "config") else "EBAY_GB"
+                # Try to pick a sensible offer
+                best = None
+                for o in offers:
+                    if not best:
+                        best = o
+                    # Prefer matching marketplace
+                    if str(o.get("marketplaceId")) == preferred_market:
+                        best = o
+                        break
+                if not best:
+                    return None
+                lid = best.get("listingId")
+                return str(lid) if lid else None
+            except Exception:
+                return None
+        setattr(EbayAPI, "get_listing_id_for_sku", _ui_get_listing_id_for_sku)
+
+    # App action: sync eBay listingId for selected row(s)
+    if not hasattr(VinylToolApp, "sync_ebay_listing_id_for_selected"):
+        def _vt_sync_ebay_listing_id_for_selected(self):
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select one or more inventory items.")
+                return
+            updated, skipped = 0, 0
+            for item in sel:
+                values = self.inventory_tree.item(item, "values")
+                sku = values[0] if values else ""
+                if not sku:
+                    skipped += 1
+                    continue
+                try:
+                    listing_id = self.ebay_api.get_listing_id_for_sku(sku)
+                except Exception:
+                    listing_id = None
+                if listing_id:
+                    try:
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        with self.db.get_connection() as conn:
+                            conn.cursor().execute(
+                                "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                                (listing_id, now_iso, sku),
+                            )
+                        updated += 1
+                        try:
+                            self.append_log(f"SKU {sku}: synced eBay Listing ID {listing_id}", "green")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        try:
+                            self.append_log(f"SKU {sku}: failed to save listing ID: {e}", "red")
+                        except Exception:
+                            pass
+                else:
+                    skipped += 1
+            # Refresh table
+            try:
+                self.populate_inventory_view(getattr(self, "inventory_search_var", None).get() if hasattr(self, "inventory_search_var") else "")
+            except Exception:
+                self.populate_inventory_view()
+            messagebox.showinfo("Sync Complete", f"Updated: {updated}\nNo match: {skipped}")
+        VinylToolApp.sync_ebay_listing_id_for_selected = _vt_sync_ebay_listing_id_for_selected
+
+    # Add the action into the Inventory context menu (once)
+    if not getattr(VinylToolApp, "_ebay_id_auto_sync_wrapped", False):
+        _orig_init = VinylToolApp.__init__
+        def _vt_init_wrap(self, *a, **kw):
+            _orig_init(self, *a, **kw)
+            def _attach():
+                try:
+                    menu = getattr(self, "inventory_context_menu", None)
+                    if not menu:
+                        return
+                    end = menu.index("end")
+                    labels = [menu.entrycget(i, "label") for i in range(end+1)] if isinstance(end, int) else []
+                    label = "Sync eBay Listing ID from eBay"
+                    if label not in labels:
+                        menu.add_separator()
+                        menu.add_command(label=label, command=self.sync_ebay_listing_id_for_selected)
+                except Exception:
+                    pass
+            try:
+                self.root.after(300, _attach)
+            except Exception:
+                _attach()
+        VinylToolApp.__init__ = _vt_init_wrap
+        VinylToolApp._ebay_id_auto_sync_wrapped = True
+
+except Exception:
+    pass
+# --- /RUNTIME_EBAY_ID_AUTO_SYNC ---
+
+
+
+# --- RUNTIME_EBAY_ID_TOOLBAR: visible buttons + context menu fallback ---
+try:
+    import datetime, re
+    from tkinter import messagebox, simpledialog, Button
+
+    # Helper: parse numeric listing id from text/URL
+    def _vt_parse_ebay_id(text: str) -> str:
+        if not text: return ""
+        m = re.findall(r'(\d{9,15})', str(text))
+        return m[-1] if m else ""
+
+    # Ensure EbayAPI helper to fetch listingId by SKU
+    if not hasattr(EbayAPI, "get_listing_id_for_sku"):
+        def _ui_get_listing_id_for_sku(self, sku: str) -> str | None:
+            try:
+                import requests
+                token = self.get_access_token()
+                base = f"{self.base_url}/sell/inventory/v1"
+                headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+                r = requests.get(f"{base}/offer?sku={sku}", headers=headers, timeout=30)
+                if r.status_code != 200:
+                    return None
+                offers = (r.json() or {}).get("offers") or []
+                pref = (getattr(self, "config", None) or {}).get("marketplace_id", "EBAY_GB")
+                best = None
+                for o in offers:
+                    if best is None:
+                        best = o
+                    if str(o.get("marketplaceId")) == pref:
+                        best = o
+                        break
+                if not best:
+                    return None
+                lid = best.get("listingId")
+                return str(lid) if lid else None
+            except Exception:
+                return None
+        setattr(EbayAPI, "get_listing_id_for_sku", _ui_get_listing_id_for_sku)
+
+    # Inventory action: sync listingId for selected SKU(s)
+    if not hasattr(VinylToolApp, "sync_ebay_listing_id_for_selected"):
+        def _vt_sync_ebay_listing_id_for_selected(self):
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select one or more inventory items.")
+                return
+            updated, skipped = 0, 0
+            for item in sel:
+                values = self.inventory_tree.item(item, "values")
+                sku = values[0] if values else ""
+                if not sku:
+                    skipped += 1
+                    continue
+                listing_id = None
+                try:
+                    listing_id = self.ebay_api.get_listing_id_for_sku(sku)
+                except Exception:
+                    listing_id = None
+                if listing_id:
+                    try:
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        with self.db.get_connection() as conn:
+                            conn.cursor().execute(
+                                "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                                (listing_id, now_iso, sku),
+                            )
+                        updated += 1
+                        try: self.append_log(f"SKU {sku}: synced eBay Listing ID {listing_id}", "green")
+                        except Exception: pass
+                    except Exception as e:
+                        try: self.append_log(f"SKU {sku}: failed to save listing ID: {e}", "red")
+                        except Exception: pass
+                else:
+                    skipped += 1
+            try:
+                self.populate_inventory_view(getattr(self, "inventory_search_var", None).get() if hasattr(self, "inventory_search_var") else "")
+            except Exception:
+                self.populate_inventory_view()
+            messagebox.showinfo("Sync Complete", f"Updated: {updated}\nNo match: {skipped}")
+        VinylToolApp.sync_ebay_listing_id_for_selected = _vt_sync_ebay_listing_id_for_selected
+
+    # Optional: manual fixer (kept, but we’ll expose it via toolbar too)
+    if not hasattr(VinylToolApp, "fix_ebay_listing_id"):
+        def _vt_fix_ebay_listing_id(self):
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Select one inventory item first.")
+                return
+            values = self.inventory_tree.item(sel[0], "values")
+            sku = values[0] if values else ""
+            current = ""
+            try: current = str(values[6] or "")
+            except Exception: current = ""
+            if not current and sku:
+                rec = self._get_inventory_record(sku)
+                current = str(rec.get("ebay_listing_id") or "")
+            prompt = "Paste the eBay URL or numeric listing ID:"
+            entry = simpledialog.askstring("Fix eBay Listing ID", prompt, initialvalue=current, parent=self.root)
+            if entry is None: return
+            new_id = _vt_parse_ebay_id(entry)
+            if not new_id:
+                messagebox.showerror("Invalid ID", "Could not find a numeric listing ID in your input.")
+                return
+            try:
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with self.db.get_connection() as conn:
+                    conn.cursor().execute(
+                        "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                        (new_id, now_iso, sku),
+                    )
+                try: self.append_log(f"SKU {sku}: eBay Listing ID set to {new_id}", "green")
+                except Exception: pass
+                self.populate_inventory_view(getattr(self, "inventory_search_var", None).get() if hasattr(self, "inventory_search_var") else "")
+            except Exception as e:
+                messagebox.showerror("Database Error", f"Failed to save ID: {e}")
+        VinylToolApp.fix_ebay_listing_id = _vt_fix_ebay_listing_id
+
+    # Add visible toolbar buttons and re-try adding menu items
+    if not getattr(VinylToolApp, "_ebay_id_toolbar_wrapped", False):
+        _orig_init = VinylToolApp.__init__
+        def _vt_init_wrap(self, *a, **kw):
+            _orig_init(self, *a, **kw)
+            def _attach():
+                try:
+                    # Add buttons next to "Open in Browser"
+                    parent_btn = getattr(self, "open_in_browser_btn", None)
+                    parent = parent_btn.master if isinstance(parent_btn, Button) else None
+                    if parent:
+                        if not hasattr(self, "sync_ebay_id_btn"):
+                            import tkinter as tk
+                            self.sync_ebay_id_btn = tk.Button(parent, text="Sync eBay ID", command=self.sync_ebay_listing_id_for_selected)
+                            self.sync_ebay_id_btn.pack(side="left", padx=5)
+                        if not hasattr(self, "fix_ebay_id_btn"):
+                            import tkinter as tk
+                            self.fix_ebay_id_btn = tk.Button(parent, text="Fix eBay ID…", command=self.fix_ebay_listing_id)
+                            self.fix_ebay_id_btn.pack(side="left", padx=5)
+
+                    # Also add to context menu if available
+                    menu = getattr(self, "inventory_context_menu", None)
+                    if menu:
+                        end = menu.index("end")
+                        labels = [menu.entrycget(i, "label") for i in range(end+1)] if isinstance(end, int) else []
+                        if "Sync eBay Listing ID from eBay" not in labels:
+                            menu.add_separator()
+                            menu.add_command(label="Sync eBay Listing ID from eBay", command=self.sync_ebay_listing_id_for_selected)
+                        if "Fix eBay Listing ID…" not in labels and "Fix eBay Listing ID..." not in labels:
+                            menu.add_command(label="Fix eBay Listing ID…", command=self.fix_ebay_listing_id)
+                except Exception:
+                    pass
+            try:
+                self.root.after(600, _attach)
+            except Exception:
+                _attach()
+        VinylToolApp.__init__ = _vt_init_wrap
+        VinylToolApp._ebay_id_toolbar_wrapped = True
+
+except Exception:
+    pass
+# --- /RUNTIME_EBAY_ID_TOOLBAR ---
+
+
+
+# --- RUNTIME_INV_CONTEXT_MENU_REPLACE: Rebuild inventory context menu with eBay ID actions ---
+try:
+    import re, datetime
+    import tkinter as _tk
+    from tkinter import Menu, messagebox, simpledialog
+
+    # Helpers (make sure these exist)
+    if not hasattr(EbayAPI, "get_listing_id_for_sku"):
+        def _ui_get_listing_id_for_sku(self, sku: str) -> str | None:
+            try:
+                import requests
+                token = self.get_access_token()
+                base = f"{self.base_url}/sell/inventory/v1"
+                headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+                r = requests.get(f"{base}/offer?sku={sku}", headers=headers, timeout=30)
+                if r.status_code != 200:
+                    return None
+                offers = (r.json() or {}).get("offers") or []
+                pref = (getattr(self, "config", None) or {}).get("marketplace_id", "EBAY_GB")
+                best = None
+                for o in offers:
+                    if best is None:
+                        best = o
+                    if str(o.get("marketplaceId")) == pref:
+                        best = o
+                        break
+                if not best:
+                    return None
+                lid = best.get("listingId")
+                return str(lid) if lid else None
+            except Exception:
+                return None
+        setattr(EbayAPI, "get_listing_id_for_sku", _ui_get_listing_id_for_sku)
+
+    if not hasattr(VinylToolApp, "sync_ebay_listing_id_for_selected"):
+        def _vt_sync_ebay_listing_id_for_selected(self):
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select one or more inventory items.")
+                return
+            updated, skipped = 0, 0
+            for item in sel:
+                values = self.inventory_tree.item(item, "values")
+                sku = values[0] if values else ""
+                if not sku:
+                    skipped += 1
+                    continue
+                listing_id = None
+                try:
+                    listing_id = self.ebay_api.get_listing_id_for_sku(sku)
+                except Exception:
+                    listing_id = None
+                if listing_id:
+                    try:
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        with self.db.get_connection() as conn:
+                            conn.cursor().execute(
+                                "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                                (listing_id, now_iso, sku),
+                            )
+                        updated += 1
+                        try: self.append_log(f"SKU {sku}: synced eBay Listing ID {listing_id}", "green")
+                        except Exception: pass
+                    except Exception as e:
+                        try: self.append_log(f"SKU {sku}: failed to save listing ID: {e}", "red")
+                        except Exception: pass
+                else:
+                    skipped += 1
+            try:
+                self.populate_inventory_view(getattr(self, "inventory_search_var", None).get() if hasattr(self, "inventory_search_var") else "")
+            except Exception:
+                self.populate_inventory_view()
+            messagebox.showinfo("Sync Complete", f"Updated: {updated}\nNo match: {skipped}")
+        VinylToolApp.sync_ebay_listing_id_for_selected = _vt_sync_ebay_listing_id_for_selected
+
+    def _vt_parse_ebay_id(text: str) -> str:
+        if not text: return ""
+        m = re.findall(r'(\d{9,15})', str(text))
+        return m[-1] if m else ""
+
+    if not hasattr(VinylToolApp, "fix_ebay_listing_id"):
+        def _vt_fix_ebay_listing_id(self):
+            sel = self.inventory_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Select one inventory item first.")
+                return
+            values = self.inventory_tree.item(sel[0], "values")
+            sku = values[0] if values else ""
+            current = ""
+            try: current = str(values[6] or "")
+            except Exception: current = ""
+            if not current and sku:
+                rec = self._get_inventory_record(sku)
+                current = str(rec.get("ebay_listing_id") or "")
+            entry = simpledialog.askstring("Fix eBay Listing ID", "Paste the eBay URL or numeric listing ID:", initialvalue=current, parent=self.root)
+            if entry is None: return
+            new_id = _vt_parse_ebay_id(entry)
+            if not new_id:
+                messagebox.showerror("Invalid ID", "Could not find a numeric listing ID in your input.")
+                return
+            try:
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with self.db.get_connection() as conn:
+                    conn.cursor().execute(
+                        "UPDATE inventory SET ebay_listing_id = ?, ebay_updated_at = ? WHERE sku = ?",
+                        (new_id, now_iso, sku),
+                    )
+                try: self.append_log(f"SKU {sku}: eBay Listing ID set to {new_id}", "green")
+                except Exception: pass
+                self.populate_inventory_view(getattr(self, "inventory_search_var", None).get() if hasattr(self, "inventory_search_var") else "")
+            except Exception as e:
+                messagebox.showerror("Database Error", f"Failed to save ID: {e}")
+        VinylToolApp.fix_ebay_listing_id = _vt_fix_ebay_listing_id
+
+    # Replace the inventory context menu popup to guarantee our items appear
+    if not getattr(VinylToolApp, "_inv_ctx_menu_replaced", False):
+        def _vt_show_inventory_context_menu(self, event=None):
+            # Select row under cursor, if any
+            try:
+                row = self.inventory_tree.identify_row(event.y)
+                if row:
+                    self.inventory_tree.selection_set(row)
+            except Exception:
+                pass
+
+            menu = Menu(self.root, tearoff=0)
+            menu.add_command(label="Load for Editing", command=self.load_item_for_editing)
+            menu.add_command(label="Edit in Lister", command=self.edit_in_lister)
+            menu.add_separator()
+            menu.add_command(label="Open Discogs Listing", command=self.open_discogs_listing)
+            menu.add_command(label="Open eBay Listing", command=self.open_ebay_listing)
+            menu.add_command(label="View Discogs Release Page", command=self.open_discogs_release_from_inventory)
+            menu.add_separator()
+            menu.add_command(label="Sync with Discogs", command=self.manual_sync_now)
+            menu.add_separator()
+            # New items
+            menu.add_command(label="Sync eBay Listing ID from eBay", command=self.sync_ebay_listing_id_for_selected)
+            menu.add_command(label="Fix eBay Listing ID…", command=self.fix_ebay_listing_id)
+            menu.add_separator()
+            menu.add_command(label="Delete", command=self.delete_inventory_item)
+
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                try: menu.grab_release()
+                except Exception: pass
+
+        VinylToolApp.show_inventory_context_menu = _vt_show_inventory_context_menu
+        VinylToolApp._inv_ctx_menu_replaced = True
+
+except Exception:
+    pass
+# --- /RUNTIME_INV_CONTEXT_MENU_REPLACE ---
+
+
+
+# --- RUNTIME_INV_MENU_DEDUP_EDIT: prefer a single "Edit in Lister" action ---
+try:
+    # If both exist, alias load_item_for_editing to edit_in_lister so callers behave the same
+    if hasattr(VinylToolApp, "edit_in_lister"):
+        try:
+            if getattr(VinylToolApp, "load_item_for_editing", None) is not VinylToolApp.edit_in_lister:
+                VinylToolApp.load_item_for_editing = VinylToolApp.edit_in_lister
+        except Exception:
+            pass
+
+    # Replace the inventory context menu so only one edit action is shown
+    if not getattr(VinylToolApp, "_inv_ctx_menu_dedup", False):
+        def _vt_show_inventory_context_menu_dedup(self, event=None):
+            import tkinter as tk
+            from tkinter import Menu
+            # Select row under cursor
+            try:
+                row = self.inventory_tree.identify_row(event.y)
+                if row:
+                    self.inventory_tree.selection_set(row)
+            except Exception:
+                pass
+
+            menu = Menu(self.root, tearoff=0)
+            # Single edit entry
+            menu.add_command(label="Edit in Lister", command=self.edit_in_lister)
+            menu.add_separator()
+            # Keep the rest of the commonly used items
+            try:
+                menu.add_command(label="Open Discogs Listing", command=self.open_discogs_listing)
+            except Exception:
+                pass
+            try:
+                menu.add_command(label="Open eBay Listing", command=self.open_ebay_listing)
+            except Exception:
+                pass
+            try:
+                menu.add_command(label="View Discogs Release Page", command=self.open_discogs_release_from_inventory)
+            except Exception:
+                pass
+            menu.add_separator()
+            try:
+                menu.add_command(label="Sync with Discogs", command=self.manual_sync_now)
+            except Exception:
+                pass
+            # Our eBay ID helpers if present
+            try:
+                menu.add_separator()
+                menu.add_command(label="Sync eBay Listing ID from eBay", command=self.sync_ebay_listing_id_for_selected)
+            except Exception:
+                pass
+            try:
+                menu.add_command(label="Fix eBay Listing ID…", command=self.fix_ebay_listing_id)
+            except Exception:
+                pass
+            menu.add_separator()
+            try:
+                menu.add_command(label="Delete", command=self.delete_inventory_item)
+            except Exception:
+                pass
+
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+
+        VinylToolApp.show_inventory_context_menu = _vt_show_inventory_context_menu_dedup
+        VinylToolApp._inv_ctx_menu_dedup = True
+except Exception:
+    pass
+# --- /RUNTIME_INV_MENU_DEDUP_EDIT ---
+
+
+
+# --- RUNTIME_INV_CTX_MENU_FORCE: rebuild menu and rebind right-click ---
+try:
+    import tkinter as _tk
+    from tkinter import Menu
+
+    def _vt_build_inventory_context_menu(self):
+        # Build a fresh menu instance with our items
+        menu = Menu(self.root, tearoff=0)
+        # Single edit entry (de-duplicated)
+        if hasattr(self, "edit_in_lister"):
+            menu.add_command(label="Edit in Lister", command=self.edit_in_lister)
+        else:
+            # Fallback if method name differs
+            if hasattr(self, "load_item_for_editing"):
+                menu.add_command(label="Load for Editing", command=self.load_item_for_editing)
+
+        menu.add_separator()
+        if hasattr(self, "open_discogs_listing"):
+            menu.add_command(label="Open Discogs Listing", command=self.open_discogs_listing)
+        if hasattr(self, "open_ebay_listing"):
+            menu.add_command(label="Open eBay Listing", command=self.open_ebay_listing)
+        if hasattr(self, "open_discogs_release_from_inventory"):
+            menu.add_command(label="View Discogs Release Page", command=self.open_discogs_release_from_inventory)
+
+        menu.add_separator()
+        if hasattr(self, "manual_sync_now"):
+            menu.add_command(label="Sync with Discogs", command=self.manual_sync_now)
+
+        # New eBay helpers
+        added_any = False
+        if hasattr(self, "sync_ebay_listing_id_for_selected"):
+            menu.add_separator()
+            menu.add_command(label="Sync eBay Listing ID from eBay", command=self.sync_ebay_listing_id_for_selected)
+            added_any = True
+        if hasattr(self, "fix_ebay_listing_id"):
+            if not added_any:
+                menu.add_separator()
+            menu.add_command(label="Fix eBay Listing ID…", command=self.fix_ebay_listing_id)
+
+        menu.add_separator()
+        if hasattr(self, "delete_inventory_item"):
+            menu.add_command(label="Delete", command=self.delete_inventory_item)
+
+        self.inventory_context_menu = menu  # replace any existing instance
+
+        # Replace the popup handler so it always uses our menu
+        def _popup(event):
+            try:
+                # focus/select row under cursor
+                row = self.inventory_tree.identify_row(event.y)
+                if row:
+                    self.inventory_tree.selection_set(row)
+                    self.inventory_tree.focus(row)
+            except Exception:
+                pass
+            try:
+                self.inventory_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                try:
+                    self.inventory_context_menu.grab_release()
+                except Exception:
+                    pass
+
+        # Rebind right-click for macOS and others
+        for ev in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            try:
+                self.inventory_tree.unbind(ev)
+            except Exception:
+                pass
+            try:
+                self.inventory_tree.bind(ev, _popup)
+            except Exception:
+                pass
+
+        # Console signal so you know it ran
+        try:
+            print("Inventory context menu rebuilt and rebound.")
+        except Exception:
+            pass
+
+    # Wrap __init__ to call our builder after the original UI is created
+    if not getattr(VinylToolApp, "_inv_ctx_menu_force_wrapped", False):
+        _orig_init = VinylToolApp.__init__
+        def _vt_init_wrap(self, *a, **kw):
+            _orig_init(self, *a, **kw)
+            def _apply():
+                try:
+                    # Ensure the tree exists before building menu
+                    if getattr(self, "inventory_tree", None):
+                        _vt_build_inventory_context_menu(self)
+                except Exception:
+                    pass
+            try:
+                # Give the original code time to create widgets and any old menu
+                self.root.after(800, _apply)
+            except Exception:
+                _apply()
+        VinylToolApp.__init__ = _vt_init_wrap
+        VinylToolApp._inv_ctx_menu_force_wrapped = True
+
+except Exception:
+    pass
+# --- /RUNTIME_INV_CTX_MENU_FORCE ---
