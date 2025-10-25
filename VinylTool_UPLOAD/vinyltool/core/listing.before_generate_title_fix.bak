@@ -1,0 +1,481 @@
+from __future__ import annotations
+from typing import *
+from vinyltool.core.logging import setup_logging
+logger = setup_logging('listing')
+import tkinter as tk
+# --- Grade abbreviations + helpers (self-contained defaults) ---
+GRADE_ABBREVIATIONS = {
+    "mint (m)": "M", "near mint (nm or m-)": "NM", "near mint (nm)": "NM", "nm or m-": "NM",
+    "very good plus (vg+)": "VG+", "vg+": "VG+", "very good (vg)": "VG", "vg": "VG",
+    "good plus (g+)": "G+", "g+": "G+", "good (g)": "G", "g": "G",
+    "fair (f)": "F", "f": "F", "poor (p)": "P", "p": "P",
+}
+def grade_abbr(value: str) -> str:
+    if not value: return ""
+    key = str(value).strip().lower()
+    return GRADE_ABBREVIATIONS.get(key, (value[:4] if len(str(value)) > 4 else str(value)))
+
+def grade_str(media: str, sleeve: str) -> str:
+    ma = grade_abbr(media); sa = grade_abbr(sleeve)
+    if ma and sa: return f"{ma}/{sa}"
+    return ma or sa or ""
+
+import urllib.parse
+import math
+import time
+import threading
+import html
+import datetime
+import json
+import re
+
+# NOTE: These helpers were methods on VinylToolApp; they now accept `app` instead of `self`.
+
+def _prepare_ebay_listing_data(app, sku):
+    """Prepare all eBay listing data from current form"""
+    format_val = app.entries["format"].get() or "LP"
+    media_cond_str = app.entries["media_condition"].get()
+    
+    condition_enum = EBAY_INVENTORY_CONDITION_MAP.get(media_cond_str, "USED_GOOD")
+    condition_id_numeric = EBAY_CONDITION_MAP_NUMERIC.get(media_cond_str, "3000")
+    category_id = EBAY_VINYL_CATEGORIES.get(format_val, "176985")
+    
+    ebay_title = app.entries["listing_title"].get() or f"{app.entries['artist'].get()} - {app.entries['title'].get()}"
+    description_html = app.full_desc.get("1.0", tk.END).strip()
+
+    return {
+        "sku": sku,
+        "title": ebay_title[:80],
+        "description": description_html,
+        "categoryId": str(category_id),
+        "price": float(app.price_entry.get()),
+        "quantity": 1,
+        "condition_enum": condition_enum,
+        "condition_id_numeric": condition_id_numeric,
+        "media_condition": app.entries["media_condition"].get(),
+        "sleeve_condition": app.entries["sleeve_condition"].get(),
+        "currency": "GBP",
+        "marketplaceId": app.config.get("marketplace_id", "EBAY_GB"),
+        "paymentPolicyId": app.config.get("ebay_payment_policy_id"),
+        "returnPolicyId": app.config.get("ebay_return_policy_id"),
+        "shippingPolicyId": app.config.get("ebay_shipping_policy_id"),
+        "images": app.image_paths,
+    }
+
+
+
+
+def _render_analog_theory_description(app, release_data):
+    """Renders the Analog Theory HTML and places it in the description box."""
+    
+    # --- Gather data from UI form and API response ---
+    payload = {
+        "artist": app.entries["artist"].get().strip(),
+        "title": app.entries["title"].get().strip(),
+        "cat_no": app.entries["cat_no"].get().strip(),
+        "year": app.entries["year"].get().strip(),
+        "format": app.entries["format"].get(),
+        "media_condition": app.entries["media_condition"].get(),
+        "sleeve_condition": app.entries["sleeve_condition"].get(),
+        "condition_notes": app.entries["condition_notes"].get("1.0", "end-1c").strip(),
+        "matrix_runout": app.entries["matrix_runout"].get("1.0", "end-1c").strip(),
+        "condition_tags": app.entries["condition_tags"].get().strip(),
+        "barcode": app.entries["barcode"].get().strip(),
+        "genre": app.entries["genre"].get().strip(),
+    }
+
+    # --- Helper functions for template ---
+    def get(key, default=''):
+        return payload.get(key) or default
+
+    def get_release_attr(data, key, default=''):
+        return data.get(key, default) if data else default
+
+    def get_label_info(data):
+        if not data or not data.get('labels'): return ''
+        return data['labels'][0].get('name', '')
+
+    def get_main_format(data):
+        if not data or not data.get('formats'): return get('format')
+        main_format = data['formats'][0].get('name', '')
+        descriptions = ", ".join(data['formats'][0].get('descriptions', []))
+        return f"{main_format}, {descriptions}" if descriptions else main_format
+
+    # --- Prepare data for the 2x3 grid ---
+    grid_data = {
+        "FORMAT": get_main_format(release_data),
+        "CAT NO": get('cat_no'),
+        "BARCODE": get('barcode'),
+        "YEAR": get('year'),
+        "PUBLISHER": get_label_info(release_data),
+        "COUNTRY": get_release_attr(release_data, 'country', '')
+    }
+    
+    info_grid_html = ""
+    for label, value in grid_data.items():
+        if value:
+            info_grid_html += f'<div class="info-box"><span class="info-label">{label}</span><span class="info-value">{value}</span></div>'
+
+    # --- Prepare other template sections ---
+    tags_raw = get('condition_tags', '').strip()
+    tags_list = [tag.strip() for tag in tags_raw.split(',') if tag.strip()]
+    tags_html = "".join([f'<div class="condition-tag">{tag}</div>' for tag in tags_list])
+
+    tracklist_html = ""
+    if release_data and release_data.get('tracklist'):
+        tracklist_items = []
+        for track in release_data['tracklist']:
+            title = track.get('title', 'Unknown Track')
+            position = (track.get('position', '') or '').strip()
+            display = f"{position}  {title}".strip()
+            tracklist_items.append(f'<li class="track"><span class="track-line">{display}</span></li>')
+        tracklist_html = f'<ul class="track-listing" style="list-style:none; margin:0; padding-left:0;">{"".join(tracklist_items)}</ul>'
+
+    
+    matrix_html = ""
+    if get('matrix_runout'):
+        matrix_html = f'<div class="details-content matrix-content">{get("matrix_runout").replace(chr(10), "<br>")}</div>'
+
+    seller_footer = app.config.get('seller_footer', '').replace('\n', '<br>')
+
+    # --- Build the final HTML ---
+            # --- Build the final HTML (inline styles only) ---
+    _pill = "display:inline-block; font-weight:bold; padding:6px 10px; border-radius:8px; border:1px solid #3a7d2c; background:#f1f9f1; color:#3a7d2c; margin:2px;"
+
+    tags_raw = (get('condition_tags') or '').strip()
+    tags_list = [t.strip() for t in tags_raw.split(',') if t.strip()]
+    tags_pills_html = "".join([f'<span style="{_pill}">{t}</span>' for t in tags_list])
+
+    condition_notes_html = (
+        '<div style="border-top:1px dashed #d6d2c9; padding:14px 0;"><strong>Condition Notes:</strong>'
+        '<div style="font-size:14px; color:#5c5c5c; margin-top:8px;">' + get('condition_notes').replace(chr(10), '<br>') + '</div></div>'
+    ) if get('condition_notes') else ''
+
+    matrix_text = get('matrix_runout') or ''
+    matrix_details_html = (
+        '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin-top:14px;">'
+        '<h3 style="margin:0 0 12px 0; font-size:16px; font-weight:bold;">Matrix / Runout Details</h3>'
+        '<div style="font-size:14px; white-space:pre-wrap;">' + matrix_text.replace(chr(10), '<br>') + '</div></div>'
+    ) if (matrix_text and len(matrix_text) > 50) else ''
+
+    tracklist_section_html = (
+        '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin-top:10px;">'
+        '<h3 style="margin:0 0 12px 0; font-size:16px; font-weight:bold;">Tracklist</h3>' + (tracklist_html or '') + '</div>'
+    ) if (tracklist_html or '') else ''
+
+    if seller_footer:
+        store_promise_html = (
+            '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin:10px 0 14px 0;">'
+            f'<p style="font-size:14px; color:#5c5c5c; margin:0;">{seller_footer}</p>'
+            '</div>'
+        )
+    else:
+        store_promise_html = (
+            '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin:10px 0 14px 0;">'
+            '<ul style="margin:0; padding:0 0 0 24px; font-size:14px; list-style:disc;">'
+            '<li style="margin:6px 0;">Professional, Secure Packaging</li>'
+            '<li style="margin:6px 0;">Fast Dispatch Royal Mail</li>'
+            '<li style="margin:6px 0;">All Stock Graded Honestly</li>'
+            '</ul>'
+            '</div>'
+        )
+
+            # --- Build the final HTML (inline styles only) ---
+    _pill = "display:inline-block; font-weight:bold; padding:6px 10px; border-radius:8px; border:1px solid #3a7d2c; background:#f1f9f1; color:#3a7d2c; margin:2px;"
+
+    tags_raw = (get('condition_tags') or '').strip()
+    tags_list = [t.strip() for t in tags_raw.split(',') if t.strip()]
+    tags_pills_html = "".join([f'<span style="{_pill}">{t}</span>' for t in tags_list])
+
+    condition_notes_html = (
+        '<div style="border-top:1px dashed #d6d2c9; padding:14px 0;"><strong>Condition Notes:</strong>'
+        '<div style="font-size:14px; color:#5c5c5c; margin-top:8px;">' + get('condition_notes').replace(chr(10), '<br>') + '</div></div>'
+    ) if get('condition_notes') else ''
+
+    matrix_text = get('matrix_runout') or ''
+    matrix_details_html = (
+        '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin-top:14px;">'
+        '<h3 style="margin:0 0 12px 0; font-size:16px; font-weight:bold;">Matrix / Runout Details</h3>'
+        '<div style="font-size:14px; white-space:pre-wrap;">' + matrix_text.replace(chr(10), '<br>') + '</div></div>'
+    ) if (matrix_text and len(matrix_text) > 50) else ''
+
+    # Always show static footer bullets, bold and 2x font size, no “why buy…” text
+    store_promise_html = (
+        '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin:10px 0 14px 0;">'
+        '<ul style="margin:0; padding:0 0 0 24px; font-size:28px; font-weight:bold; list-style:disc;">'
+        '<li style="margin:10px 0;">Professional, Secure Packaging</li>'
+        '<li style="margin:10px 0;">Fast Dispatch Royal Mail</li>'
+        '<li style="margin:10px 0;">All Stock Graded Honestly</li>'
+        '</ul>'
+        '</div>'
+    )
+
+            # --- Build the final HTML (inline styles only) ---
+    _pill = "display:inline-block; font-weight:bold; padding:6px 10px; border-radius:8px; border:1px solid #3a7d2c; background:#f1f9f1; color:#3a7d2c; margin:2px;"
+
+    tags_raw = (get('condition_tags') or '').strip()
+    tags_list = [t.strip() for t in tags_raw.split(',') if t.strip()]
+    tags_pills_html = "".join([f'<span style="{_pill}">{t}</span>' for t in tags_list])
+
+    condition_notes_html = (
+        '<div style="border-top:1px dashed #d6d2c9; padding:14px 0;"><strong>Condition Notes:</strong>'
+        '<div style="font-size:14px; color:#5c5c5c; margin-top:8px;">' + get('condition_notes').replace(chr(10), '<br>') + '</div></div>'
+    ) if get('condition_notes') else ''
+
+    matrix_text = get('matrix_runout') or ''
+    matrix_details_html = (
+        '<div style="border:1px solid #d6d2c9; border-radius:8px; padding:12px; background:#ffffff; margin-top:14px;">'
+        '<h3 style="margin:0 0 12px 0; font-size:16px; font-weight:bold;">Matrix / Runout Details</h3>'
+        '<div style="font-size:14px; white-space:pre-wrap;">' + matrix_text.replace(chr(10), '<br>') + '</div></div>'
+    ) if (matrix_text and len(matrix_text) > 50) else ''
+
+    # Footer: professional 3-column feature grid with green ticks
+    store_promise_html = (
+        '<div style="border:1px solid #e3e0d8; border-radius:12px; padding:16px; background:#fffefb; margin:12px 0 16px 0;">'
+          '<table role="presentation" style="width:100%; border-collapse:separate; border-spacing:8px;">'
+            '<tr>'
+              '<td style="width:33.33%; vertical-align:top; padding:10px; border:1px solid #e3e0d8; border-radius:10px; background:#ffffff;">'
+                '<div style="display:flex; align-items:flex-start; gap:10px;">'
+                  '<span aria-hidden="true" style="font-size:22px; line-height:1; margin-top:2px;">✅</span>'
+                  '<span style="font-size:18px; font-weight:600; color:#1a1a1a; line-height:1.4;">Professional, Secure Packaging</span>'
+                '</div>'
+              '</td>'
+              '<td style="width:33.33%; vertical-align:top; padding:10px; border:1px solid #e3e0d8; border-radius:10px; background:#ffffff;">'
+                '<div style="display:flex; align-items:flex-start; gap:10px;">'
+                  '<span aria-hidden="true" style="font-size:22px; line-height:1; margin-top:2px;">✅</span>'
+                  '<span style="font-size:18px; font-weight:600; color:#1a1a1a; line-height:1.4;">Fast Dispatch Royal Mail</span>'
+                '</div>'
+              '</td>'
+              '<td style="width:33.33%; vertical-align:top; padding:10px; border:1px solid #e3e0d8; border-radius:10px; background:#ffffff;">'
+                '<div style="display:flex; align-items:flex-start; gap:10px;">'
+                  '<span aria-hidden="true" style="font-size:22px; line-height:1; margin-top:2px;">✅</span>'
+                  '<span style="font-size:18px; font-weight:600; color:#1a1a1a; line-height:1.4;">All Stock Graded Honestly</span>'
+                '</div>'
+              '</td>'
+            '</tr>'
+          '</table>'
+        '</div>'
+    )
+
+    html = f"""
+    <div style="max-width: 860px; width: 100%; margin: 0 auto; background: #fffdf9; border: 1px solid #d6d2c9; border-radius: 12px; overflow: hidden; font-family: Arial, 'Helvetica Neue', sans-serif; color: #1a1a1a; font-size: 16px; line-height: 1.55;">
+      <div style="padding: 20px 22px; border-bottom: 1px solid #d6d2c9; background: #ffffff;">
+        <table style="width: 100%; border-collapse: collapse;">
+          <tr>
+            <td style="width: 44px; vertical-align: middle; padding-right: 16px;">
+              <div style="width: 44px; height: 44px; border-radius: 8px; border: 1px solid #d6d2c9; background: linear-gradient(135deg, #b8e6ff, #e8f7ff);"></div>
+            </td>
+            <td style="vertical-align: middle;">
+              <h1 style="margin: 0; font-size: 20px; font-weight: bold; color: #1a1a1a;">{get('artist')} – {get('title')}</h1>
+            </td>
+            <td style="text-align: right; vertical-align: middle;">
+              <span style="display: inline-block; border: 1px solid #d6d2c9; color: #5c5c5c; padding: 6px 12px; border-radius: 20px; font-size: 14px;">In Stock</span>
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div style="padding: 20px 22px;">
+        <table style="width: 100%; border-collapse: separate; border-spacing: 10px; margin: 16px 0;">
+          <tr>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Format</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get_main_format(release_data)}</span>
+            </td>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Cat No</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get('cat_no')}</span>
+            </td>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Year</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get('year')}</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Label</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get_label_info(release_data)}</span>
+            </td>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Country</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get_release_attr(release_data, 'country', '')}</span>
+            </td>
+            <td style="border: 1px solid #d6d2c9; border-radius: 8px; padding: 10px 12px; background: #ffffff; width: 33%; vertical-align: top;">
+              <span style="display:block; font-size:12px; color:#5c5c5c; text-transform:uppercase; letter-spacing:0.5px;">Barcode</span>
+              <span style="display:block; font-weight:bold; margin-top:4px;">{get('barcode')}</span>
+            </td>
+          </tr>
+        </table>
+
+        <!-- Condition block -->
+        <div style="border-top:1px dashed #d6d2c9; padding:14px 0;">
+          <div style="display:block;">
+            <strong style="font-size:16px; display:block;">Condition</strong>
+            <div style="font-size:14px; color:#5c5c5c; margin:6px 0 8px 0;">Graded under strong light.</div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <span style="{_pill}">Vinyl: {GRADE_ABBREVIATIONS.get(get('media_condition'), '')}</span>
+              <span style="{_pill}">Sleeve: {GRADE_ABBREVIATIONS.get(get('sleeve_condition'), '')}</span>
+              {tags_pills_html}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {condition_notes_html}
+      {matrix_details_html}
+      {tracklist_section_html}
+
+      {store_promise_html}
+    </div>
+    """
+    final_html = '\n'.join([line.strip() for line in html.split('\n')])
+    app.full_desc.delete("1.0", tk.END)
+    app.full_desc.insert("1.0", final_html)
+
+
+
+def build_description(app,):
+    """Build full description with tracklist using the Analog Theory template."""
+    if not app.current_release_id:
+        messagebox.showwarning("No Release", "Please select a Discogs release first to get tracklist data.")
+        app._render_analog_theory_description(None)
+        return
+    
+    app.root.config(cursor="watch")
+    app.root.update()
+    
+    def fetch_worker():
+        try:
+            release = app.discogs_api.get_release(app.current_release_id)
+            app.safe_after(0, lambda: app._render_analog_theory_description(release))
+        except Exception as e:
+            app.safe_after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            app.safe_after(0, lambda: app.root.config(cursor=""))
+    
+    threading.Thread(target=fetch_worker, daemon=True).start()
+
+
+
+
+
+
+
+def generate_listing_title(app):
+    """
+    Format: ARTIST: Title (YEAR) [2x ]Vinyl LP NM/NM
+    - ARTIST uppercased
+    - Always 'Vinyl LP' (prepend '2x ' etc if present in format)
+    - Grades via grade_str(...) then uppercased
+    - Never include barcode-like cat# (>=10 digits)
+    """
+    import re
+
+    artist = _e(app, "artist").upper()
+    title  = _e(app, "title")
+    year   = _e(app, "year")
+    fmt_raw= _e(app, "format")
+    catno  = _e(app, "catno")
+    media  = _e(app, "media_condition")
+    sleeve = _e(app, "sleeve_condition")
+
+    # Drop catno if barcode-like
+    if catno.isdigit() and len(catno) >= 10:
+        catno = ""
+
+    # Canonicalise format -> "[Nx ]Vinyl LP"
+    # Detect leading count like "2x", "3 x"
+    mcount = re.search(r"(\d+)\s*x", fmt_raw or "", re.I)
+    count = (mcount.group(1) + "x ") if mcount else ""
+    fmt = f"{count}Vinyl LP"
+
+    # Grades as NM/NM
+    try:
+        grades = grade_str(media, sleeve).upper()
+    except Exception:
+        grades = ""
+
+    # Build: ARTIST: Title (YEAR) Vinyl LP NM/NM
+    head = f"{artist}: {title}" if title else artist
+    parts = [head]
+    if year: parts.append(f"({year})")
+    parts.append(fmt)
+    if grades: parts.append(grades)
+
+    full = " ".join(parts)
+
+    # Final tidy (remove numeric barcode chunks and normalise)
+    try:
+        full = normalize_title_string(full)
+    except Exception:
+        pass
+
+    try:
+        maxlen = MAX_TITLE_LEN
+    except NameError:
+        maxlen = 80
+    full = full[:maxlen]
+
+    _set_entry(app, "listing_title", full)
+    return full
+def normalize_title_string(t: str) -> str:
+    """Remove barcode-like tokens (10–14 digits) and normalise verbose grades to nm/vg+/..."""
+    import re
+    if not t:
+        return t
+    # remove standalone 10–14 digit chunks (likely barcodes)
+    def _is_barcode_like(x: str) -> bool:
+        return bool(re.fullmatch(r"\s*\d{10,14}\s*", str(x) or ""))
+    # split on common separators but keep them for re-join
+    parts = re.split(r"(\s[-|•,–—]\s)", t)
+    out = []
+    for i, chunk in enumerate(parts):
+        if i % 2 == 0:
+            if _is_barcode_like(chunk):
+                continue
+        out.append(chunk)
+    t = "".join(out)
+    # normalise verbose grades in case any slipped through
+    repl = [
+        (r"(?i)near\s+mint", "nm"),
+        (r"(?i)mint", "m"),
+        (r"(?i)very\s+good\s*\+", "vg+"),
+        (r"(?i)very\s+good", "vg"),
+        (r"(?i)good\s*\+", "g+"),
+        (r"(?i)good", "g"),
+        (r"(?i)fair", "f"),
+        (r"(?i)poor", "p"),
+    ]
+    for pat, sub in repl:
+        t = re.sub(pat, sub, t)
+    return t
+
+
+def _e(app, key, default=""):
+    """Safe entry fetch: returns stripped string from app.entries[key] if widget/string, else default."""
+    w = getattr(app, "entries", {}).get(key, default)
+    try:
+        # Tk Entry/StringVar-like
+        if hasattr(w, "get"):
+            return (w.get() or "").strip()
+        # already a string
+        return (w or default).strip()
+    except Exception:
+        return str(w).strip() if w else default
+
+
+def _set_entry(app, key, value):
+    """Safely update a Tkinter entry or StringVar in app.entries."""
+    w = getattr(app, "entries", {}).get(key)
+    if w is None:
+        return
+    try:
+        # Tkinter Entry widget
+        w.delete(0, "end")
+        w.insert(0, value)
+    except Exception:
+        try:
+            # Maybe a StringVar
+            w.set(value)
+        except Exception:
+            pass

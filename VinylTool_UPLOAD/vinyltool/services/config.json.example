@@ -1,0 +1,7 @@
+{
+  "EBAY_APP_ID": "SET_ME_VIA_ENV",
+  "EBAY_CERT_ID": "SET_ME_VIA_ENV",
+  "EBAY_DEV_ID": "SET_ME_VIA_ENV",
+  "DISCOGS_TOKEN": "SET_ME_VIA_ENV",
+  "NOTES": "This example file is for reference. Put real secrets in profiles/*/data/.env (not tracked)."
+}
