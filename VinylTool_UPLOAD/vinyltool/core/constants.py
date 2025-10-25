@@ -1,0 +1,109 @@
+"""
+VinylTool Constants
+===================
+All constant definitions for the application.
+"""
+
+EBAY_SITE_ID = "3"  # UK site
+
+EBAY_CURRENCY = "GBP"
+
+EBAY_VINYL_CATEGORIES = {
+    "LP": "176985",
+    "12\"": "176985",
+    "7\"": "176984",
+    "10\"": "176985",
+    "Box Set": "176985",
+    "Other": "176983"
+}
+
+EBAY_CONDITION_MAP_NUMERIC = {
+    "Mint": "1000",             # New (sealed)
+    "Near Mint": "2000",         # Near Mint / NM- mapped to Like New (2000)
+    "Excellent": "2750",         # Excellent (VG++) maps to Very Good Plus (2750)
+    "Very Good Plus": "2750",   # Very Good Plus maps to Very Good Plus (2750)
+    "Very Good": "4000",         # Very Good maps to Very Good (4000)
+    "Good Plus": "5000",         # Good Plus maps to Good (5000)
+    "Good": "5000",              # Good maps to Good (5000)
+    "Fair": "6000",              # Fair maps to Acceptable (6000)
+    "Poor": "7000"               # Poor maps to For Parts/Not Working (7000)
+}
+
+EBAY_INVENTORY_CONDITION_MAP = {
+    "Mint": "NEW",
+    "Near Mint": "LIKE_NEW",
+    "Excellent": "USED_EXCELLENT",
+    "Very Good Plus": "USED_EXCELLENT",
+    "Very Good": "USED_VERY_GOOD",
+    "Good": "USED_GOOD",
+    "Good Plus": "USED_GOOD",
+    "Fair": "USED_ACCEPTABLE",
+    "Poor": "FOR_PARTS_OR_NOT_WORKING"
+}
+
+EBAY_SHIPPING_MAP = {
+    "Standard UK Paid": "UK_RoyalMailSecondClassStandard",
+    "Free UK": "UK_RoyalMailSecondClassStandard"
+}
+
+LOCAL_STATUSES = [
+    "For Sale", "Sold", "Not For Sale", "Draft", "Reserved",
+    "Damaged", "Missing", "Pending", "Hold", "eBay Ready"
+]
+
+DEFAULT_STATUS_MAPPINGS = {
+    "For Sale": "For Sale",
+    "Draft": "Draft", 
+    "Expired": "Not For Sale",
+    "Sold": "Sold",
+    "Suspended": "Not For Sale",
+    "Deleted": "Not For Sale"
+}
+
+GRADE_ABBREVIATIONS = {
+    "Mint": "M", "Near Mint": "NM", "Excellent": "EX",
+    "Very Good Plus": "VG+", "Very Good": "VG", "Good Plus": "G+",
+    "Good": "G", "Fair": "F", "Poor": "P", "Generic": "G"
+}
+
+DISCOGS_GRADE_MAP = {
+    "Mint (M)": "Mint",
+    "Near Mint (NM or M-)": "Near Mint",
+    "Very Good Plus (VG+)": "Very Good Plus",
+    "Very Good (VG)": "Very Good",
+    "Good Plus (G+)": "Good Plus",
+    "Good (G)": "Good",
+    "Fair (F)": "Fair",
+    "Poor (P)": "Poor",
+    "Generic": "Generic"
+}
+
+REVERSE_GRADE_MAP = {v: k for k, v in DISCOGS_GRADE_MAP.items()}
+
+GRADING_MEDIA = {
+    "M": "Perfect condition, no visible flaws",
+    "NM": "Like new with only very minor signs of handling",
+    "EX": "Some minor visible wear but plays perfectly",
+    "VG+": "Light wear, minor scuffs but no effect on sound quality",
+    "VG": "Noticeable wear, some light scratches may affect sound slightly",
+    "G+": "Considerable wear, scratches present, some effect on sound",
+    "G": "Heavy wear, scratches and marks present, noticeable effect on playback",
+    "F": "Considerable damage, playable but with significant surface noise",
+    "P": "Badly damaged, may skip or have serious playback issues"
+}
+
+GRADING_SLEEVE = {
+    "M": "Perfect condition, no ring wear, creases, or marks",
+    "NM": "Like new with only very minor corner wear or slight edge wear",
+    "EX": "Some minor corner wear, slight ring wear, or edge wear",
+    "VG+": "Light ring wear, minor seam splits, or corner wear",
+    "VG": "Moderate ring wear, some seam splits, or corner damage",
+    "G+": "Considerable wear, seam splits, or writing on cover",
+    "G": "Heavy wear, major seam splits, ring wear, or writing",
+    "F": "Cover damaged but still holding together, major wear",
+    "P": "Cover severely damaged, split seams, or pieces missing"
+}
+
+# backup_test_marker
+
+# backup_test_marker
