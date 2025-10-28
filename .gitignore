@@ -1,0 +1,9 @@
+# keep real secrets out of git
+VinylTool_UPLOAD/vinyltool/services/config.json
+profiles/*/data/config.json
+profiles/*/data/api_clients.py
+profiles/*/data/*.env
+*.sqlite
+*.db
+.env
+.DS_Store
